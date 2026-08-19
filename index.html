@@ -585,14 +585,17 @@
         // ============================================================
         // 5. INVENTORY (Firestore-backed)
         // ============================================================
+        const GST_SLABS = [0, 5, 12, 18, 28];
+
         const Inventory = ({ orgId, products, isAdmin, lang }) => {
-            const [form, setForm] = useState({ name: '', category: 'Hardware', unit: 'Pcs', priceBuy: '', priceSell: '', stock: '', gst: 18, discount: 0, brand: '', spec: '', barcode: '' });
+            const [form, setForm] = useState({ name: '', category: 'Hardware', unit: 'Pcs', priceBuy: '', priceSell: '', stock: '', gstApplicable: true, gst: 18, discountAllowed: true, discount: 0, brand: '', spec: '', barcode: '' });
             const [search, setSearch] = useState('');
             const [suggestions, setSuggestions] = useState([]);
             const [restockProd, setRestockProd] = useState(null); // set when an existing product is picked
             const [supplier, setSupplier] = useState({ name: '', mobile: '' });
             const [purchaseMode, setPurchaseMode] = useState('Cash'); // Cash | Udhar (admin only, tracks supplier khata)
             const [purchaseGstIncluded, setPurchaseGstIncluded] = useState(false); // is GST already included in Purchase Rate?
+            const [purchaseDueDate, setPurchaseDueDate] = useState(''); // when supplier payment is due (Udhar purchases)
             const [quickBase, setQuickBase] = useState(''); // base item picked from catalog, e.g. "TMT Steel Bar"
             const [importBusy, setImportBusy] = useState(false);
             const [importMsg, setImportMsg] = useState('');
@@ -603,12 +606,13 @@
             const catalogEntry = CATALOG[form.category];
 
             const resetForm = () => {
-                setForm({ name: '', category: 'Hardware', unit: 'Pcs', priceBuy: '', priceSell: '', stock: '', gst: 18, discount: 0, brand: '', spec: '', barcode: '' });
+                setForm({ name: '', category: 'Hardware', unit: 'Pcs', priceBuy: '', priceSell: '', stock: '', gstApplicable: true, gst: 18, discountAllowed: true, discount: 0, brand: '', spec: '', barcode: '' });
                 setRestockProd(null);
                 setSuggestions([]);
                 setSupplier({ name: '', mobile: '' });
                 setPurchaseMode('Cash');
                 setPurchaseGstIncluded(false);
+                setPurchaseDueDate('');
                 setQuickBase('');
             };
 
@@ -648,7 +652,7 @@
                 setForm({
                     name: p.name, category: p.category, unit: p.unit,
                     priceBuy: p.priceBuy, priceSell: p.priceSell,
-                    stock: '', gst: p.gst, discount: p.discount,
+                    stock: '', gstApplicable: p.gstApplicable !== false, gst: p.gst, discountAllowed: p.discountAllowed !== false, discount: p.discount,
                     brand: p.brand || '', spec: p.spec || '', barcode: p.barcode || ''
                 });
                 setRestockProd(p);
@@ -662,7 +666,7 @@
 
                 const stockQty = Number(form.stock) || 0;
                 const buyRate = Number(form.priceBuy) || 0;
-                const gstPct = Number(form.gst) || 0;
+                const gstPct = form.gstApplicable ? (Number(form.gst) || 0) : 0;
                 const purchaseCost = buyRate * stockQty;
                 const purchaseGstAmt = purchaseGstIncluded ? 0 : purchaseCost * (gstPct / 100);
                 const purchaseTotal = purchaseCost + purchaseGstAmt; // what's actually payable to the supplier
@@ -686,14 +690,16 @@
                     batch.update(productRef, {
                         category: form.category, unit: form.unit, brand: form.brand || '', spec: form.spec || '', barcode: form.barcode || '',
                         priceBuy: buyRate, priceSell: Number(form.priceSell),
-                        gst: gstPct, discount: Number(form.discount) || 0,
+                        gstApplicable: !!form.gstApplicable, gst: gstPct,
+                        discountAllowed: !!form.discountAllowed, discount: form.discountAllowed ? (Number(form.discount) || 0) : 0,
                         stock: FieldValue.increment(stockQty)
                     });
                 } else {
                     batch.set(productRef, {
                         name: form.name, category: form.category, unit: form.unit, brand: form.brand || '', spec: form.spec || '', barcode: form.barcode || '',
                         priceBuy: buyRate, priceSell: Number(form.priceSell),
-                        stock: stockQty, gst: gstPct, discount: Number(form.discount) || 0,
+                        stock: stockQty, gstApplicable: !!form.gstApplicable, gst: gstPct,
+                        discountAllowed: !!form.discountAllowed, discount: form.discountAllowed ? (Number(form.discount) || 0) : 0,
                         createdAt: FieldValue.serverTimestamp()
                     });
                 }
@@ -706,10 +712,18 @@
                     }, { merge: true });
                     const txnRef = supplierPartyRef.collection('transactions').doc();
                     batch.set(txnRef, {
-                        type: 'purchase_credit', amount: purchaseTotal,
+                        type: 'purchase_credit', amount: purchaseTotal, dueDate: purchaseDueDate || null,
                         note: `${form.name} x ${stockQty} ${form.unit}${purchaseGstAmt > 0 ? ` (incl. GST ₹${purchaseGstAmt.toFixed(2)})` : ''}`,
                         date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp()
                     });
+                    if (purchaseDueDate) {
+                        batch.set(db.collection('orgs').doc(orgId).collection('dueReminders').doc(), {
+                            partyId: supplierPartyRef.id, partyName: supplier.name, partyType: 'supplier',
+                            site: '', amount: purchaseTotal, dueDate: purchaseDueDate,
+                            note: `${form.name} x ${stockQty} ${form.unit}`,
+                            resolved: false, createdAt: FieldValue.serverTimestamp()
+                        });
+                    }
                 }
 
                 await batch.commit();
@@ -871,10 +885,29 @@
                             {isAdmin && <input type="number" placeholder={t(lang, 'inv_purchaseRate')} className="border p-2 rounded" value={form.priceBuy} onChange={e => setForm({ ...form, priceBuy: e.target.value })} />}
                             <input type="number" placeholder={t(lang, 'inv_sellRate')} className="border p-2 rounded" value={form.priceSell} onChange={e => setForm({ ...form, priceSell: e.target.value })} required />
                             <input type="number" placeholder={restockProd ? t(lang, 'inv_addStockQty') : t(lang, 'inv_initialStock')} className="border p-2 rounded" value={form.stock} onChange={e => setForm({ ...form, stock: e.target.value })} />
-                            <div className="flex gap-2">
-                                <input type="number" placeholder={t(lang, 'inv_gst')} className="border p-2 rounded w-1/2" value={form.gst} onChange={e => setForm({ ...form, gst: e.target.value })} />
-                                <input type="number" placeholder={t(lang, 'inv_disc')} className="border p-2 rounded w-1/2" value={form.discount} onChange={e => setForm({ ...form, discount: e.target.value })} />
+
+                            <div className="col-span-2 md:col-span-4 bg-gray-50 border rounded p-2 flex flex-wrap gap-4 items-center">
+                                <label className="flex items-center gap-2 text-sm cursor-pointer">
+                                    <input type="checkbox" checked={form.gstApplicable} onChange={e => setForm({ ...form, gstApplicable: e.target.checked })} />
+                                    <span className="font-bold">GST Lagta Hai Is Item Par?</span>
+                                </label>
+                                {form.gstApplicable && (
+                                    <select className="border p-1 rounded text-sm" value={form.gst} onChange={e => setForm({ ...form, gst: e.target.value })}>
+                                        {GST_SLABS.map(g => <option key={g} value={g}>{g}%</option>)}
+                                    </select>
+                                )}
+                                {!form.gstApplicable && <span className="text-xs text-gray-400">GST-Free Item</span>}
+
+                                <label className="flex items-center gap-2 text-sm cursor-pointer ml-4">
+                                    <input type="checkbox" checked={form.discountAllowed} onChange={e => setForm({ ...form, discountAllowed: e.target.checked })} />
+                                    <span className="font-bold">Discount Allowed Hai?</span>
+                                </label>
+                                {form.discountAllowed && (
+                                    <input type="number" placeholder="Default Disc %" className="border p-1 rounded text-sm w-28" value={form.discount} onChange={e => setForm({ ...form, discount: e.target.value })} />
+                                )}
+                                {!form.discountAllowed && <span className="text-xs text-gray-400">Fixed Rate — Koi Discount Nahi</span>}
                             </div>
+
                             <input placeholder="Barcode (optional, scan karo)" className="border p-2 rounded" value={form.barcode} onChange={e => setForm({ ...form, barcode: e.target.value })} />
                             <button type="submit" className={`p-2 rounded text-white font-bold ${restockProd ? 'bg-blue-600 hover:bg-blue-700' : 'bg-green-600 hover:bg-green-700'}`}>
                                 {restockProd ? t(lang, 'inv_addStockBtn') : t(lang, 'inv_addBtn')}
@@ -895,6 +928,10 @@
                                         <>
                                             <input className="border p-1 rounded text-sm" placeholder={t(lang, 'inv_supplierName')} value={supplier.name} onChange={e => setSupplier({ ...supplier, name: e.target.value })} />
                                             <input className="border p-1 rounded text-sm" placeholder={t(lang, 'inv_supplierMobile')} value={supplier.mobile} onChange={e => setSupplier({ ...supplier, mobile: e.target.value })} />
+                                            <div>
+                                                <label className="text-xs text-gray-500 block">Payment kab tak dena hai?</label>
+                                                <input type="date" className="border p-1 rounded text-sm" value={purchaseDueDate} onChange={e => setPurchaseDueDate(e.target.value)} />
+                                            </div>
                                         </>
                                     )}
                                 </div>
@@ -902,7 +939,7 @@
                                 {Number(form.priceBuy) > 0 && (() => {
                                     const qty = Number(form.stock) || 0;
                                     const rate = Number(form.priceBuy) || 0;
-                                    const gstPct = Number(form.gst) || 0;
+                                    const gstPct = form.gstApplicable ? (Number(form.gst) || 0) : 0;
                                     const cost = rate * qty;
                                     const gstAmt = purchaseGstIncluded ? 0 : cost * (gstPct / 100);
                                     const total = cost + gstAmt;
@@ -953,6 +990,7 @@
                                     <th className="p-2">{t(lang, 'inv_category')}</th>
                                     <th className="p-2">{t(lang, 'inv_stock')}</th>
                                     <th className="p-2">{t(lang, 'inv_sellRateCol')}</th>
+                                    <th className="p-2">GST</th>
                                     <th className="p-2">{t(lang, 'inv_discCol')}</th>
                                     <th className="p-2">{t(lang, 'inv_action')}</th>
                                 </tr>
@@ -966,7 +1004,10 @@
                                         <td className="p-2">{catLabel(lang, p.category)}</td>
                                         <td className={`p-2 font-bold ${p.stock < 10 ? 'text-red-600' : 'text-green-600'}`}>{p.stock} {unitLabel(lang, p.unit)}</td>
                                         <td className="p-2">₹{p.priceSell}</td>
-                                        <td className="p-2">{p.discount}%</td>
+                                        <td className="p-2">
+                                            {p.gstApplicable === false ? <span className="text-xs bg-gray-100 text-gray-500 px-2 py-0.5 rounded">No GST</span> : <span className="text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded font-bold">{p.gst || 0}%</span>}
+                                        </td>
+                                        <td className="p-2">{p.discountAllowed === false ? <span className="text-xs text-gray-400">Fixed</span> : `${p.discount}%`}</td>
                                         <td className="p-2">{isAdmin && <button onClick={() => handleDelete(p.id)} className="text-red-500 hover:text-red-700">{t(lang, 'inv_delete')}</button>}</td>
                                     </tr>
                                 ))}
@@ -980,6 +1021,8 @@
         // ============================================================
         // 6. POS / BILLING
         // ============================================================
+        const PAYMENT_METHODS = ['Cash', 'UPI', 'Bank Transfer', 'Cheque', 'Card'];
+
         const POS = ({ orgId, org, products, userDoc, firebaseUser, lang }) => {
             const [cart, setCart] = useState([]);
             const [query, setQuery] = useState('');
@@ -989,7 +1032,11 @@
             const [discInput, setDiscInput] = useState('');
             const [billType, setBillType] = useState('Estimate');
             const [paymentMode, setPaymentMode] = useState('Cash'); // Cash | Udhar | Split
+            const [paymentMethod, setPaymentMethod] = useState('Cash'); // how the paid portion was received: Cash/UPI/Bank Transfer/Cheque/Card
             const [splitCash, setSplitCash] = useState('');
+            const [udharSite, setUdharSite] = useState(''); // which site/project this credit is for (contractor customers)
+            const [udharDueDate, setUdharDueDate] = useState('');
+            const [billDiscount, setBillDiscount] = useState(''); // extra flat ₹ discount on the whole bill
             const [customer, setCustomer] = useState({ name: '', mobile: '', gst: '', address: '' });
             const [saving, setSaving] = useState(false);
 
@@ -1041,7 +1088,7 @@
                 if (!qtyInput || Number(qtyInput) <= 0) return;
                 const qty = Number(qtyInput);
                 if (selectedProd.stock < qty) { alert(`Stock kam hai! Available: ${selectedProd.stock}`); return; }
-                const disc = discInput === '' ? 0 : Number(discInput);
+                const disc = selectedProd.discountAllowed === false ? 0 : (discInput === '' ? 0 : Number(discInput));
                 const finalPrice = selectedProd.priceSell - (selectedProd.priceSell * (disc / 100));
                 const newItem = { ...selectedProd, qty, discount: disc, finalPrice, total: finalPrice * qty, profit: (finalPrice - selectedProd.priceBuy) * qty };
                 setCart([...cart, newItem]);
@@ -1052,7 +1099,7 @@
             const selectProduct = (prod) => {
                 setSelectedProd(prod);
                 setQtyInput('');
-                setDiscInput(prod.discount || 0); // pre-fill with product's default discount, but staff can change it for this sale
+                setDiscInput(prod.discountAllowed === false ? 0 : (prod.discount || 0)); // pre-fill with product's default discount, but staff can change it for this sale
                 setTimeout(() => qtyRef.current && qtyRef.current.focus(), 100);
             };
 
@@ -1064,27 +1111,34 @@
 
             const completeSale = async (shouldPrint) => {
                 if (cart.length === 0) return alert('Cart Empty!');
-                const provisionalTotal = cart.reduce((s, i) => s + i.total, 0) + (billType === 'Tax Invoice' ? cart.reduce((s, i) => s + i.total * ((i.gst || 0) / 100), 0) : 0);
+
+                const subtotal = cart.reduce((sum, item) => sum + item.total, 0);
+                const gstAmount = billType === 'Tax Invoice' ? cart.reduce((sum, item) => sum + item.total * ((item.gst || 0) / 100), 0) : 0;
+                const billDiscountAmt = Math.min(Number(billDiscount) || 0, subtotal + gstAmount);
+                const beforeRound = subtotal + gstAmount - billDiscountAmt;
+                const grandTotal = Math.round(beforeRound);
+                const roundOff = grandTotal - beforeRound;
+
                 let udharPortion = 0;
-                if (paymentMode === 'Udhar') udharPortion = provisionalTotal;
+                if (paymentMode === 'Udhar') udharPortion = grandTotal;
                 else if (paymentMode === 'Split') {
-                    udharPortion = Math.max(0, provisionalTotal - (Number(splitCash) || 0));
-                    if ((Number(splitCash) || 0) > provisionalTotal) { alert('Cash amount total se zyada nahi ho sakta.'); return; }
+                    udharPortion = Math.max(0, grandTotal - (Number(splitCash) || 0));
+                    if ((Number(splitCash) || 0) > grandTotal) { alert('Cash amount total se zyada nahi ho sakta.'); return; }
                 }
                 if (udharPortion > 0 && !customer.name.trim()) { alert('Udhar ke liye Customer Name daalna zaroori hai!'); return; }
                 if (saving) return;
                 setSaving(true);
                 try {
-                    const subtotal = cart.reduce((sum, item) => sum + item.total, 0);
-                    const gstAmount = billType === 'Tax Invoice' ? cart.reduce((sum, item) => sum + item.total * ((item.gst || 0) / 100), 0) : 0;
-                    const grandTotal = subtotal + gstAmount;
                     const cashAmount = grandTotal - udharPortion;
                     const totalProfit = cart.reduce((sum, item) => sum + (item.profit || 0), 0);
                     const saleData = {
                         date: new Date().toISOString(),
                         createdAt: FieldValue.serverTimestamp(),
-                        customer, cart, subtotal, gstAmount, grandTotal, totalProfit, billType, paymentMode,
+                        customer, cart, subtotal, gstAmount, billDiscount: billDiscountAmt, roundOff, grandTotal, totalProfit, billType, paymentMode,
+                        paymentMethod: cashAmount > 0 ? paymentMethod : null,
                         cashAmount, udharAmount: udharPortion,
+                        site: udharPortion > 0 ? (udharSite || '') : '',
+                        dueDate: udharPortion > 0 ? (udharDueDate || null) : null,
                         voided: false,
                         returnedTotal: 0, returnedProfit: 0,
                         printed: shouldPrint,
@@ -1122,10 +1176,19 @@
                         }, { merge: true });
                         const txnRef = partyRef.collection('transactions').doc();
                         batch.set(txnRef, {
-                            type: 'sale_credit', amount: udharPortion, note: `Bill #${saleRef.id.slice(-6)}${paymentMode === 'Split' ? ' (part payment)' : ''}`,
+                            type: 'sale_credit', amount: udharPortion, site: udharSite || '', dueDate: udharDueDate || null,
+                            note: `Bill #${saleRef.id.slice(-6)}${paymentMode === 'Split' ? ' (part payment)' : ''}`,
                             billId: saleRef.id, date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp(),
                             staffUid: firebaseUser.uid, staffName: userDoc.name
                         });
+                        if (udharDueDate) {
+                            batch.set(db.collection('orgs').doc(orgId).collection('dueReminders').doc(), {
+                                partyId: partyRef.id, partyName: customer.name, partyType: 'customer',
+                                site: udharSite || '', amount: udharPortion, dueDate: udharDueDate,
+                                note: `Bill #${saleRef.id.slice(-6)}`,
+                                resolved: false, createdAt: FieldValue.serverTimestamp()
+                            });
+                        }
                     }
 
                     // Sale is ALWAYS saved to Firestore regardless of whether it's printed —
@@ -1137,7 +1200,8 @@
                         window.print();
                     }
 
-                    setCart([]); setCustomer({ name: '', mobile: '', gst: '', address: '' }); setQuery(''); setPaymentMode('Cash'); setSplitCash('');
+                    setCart([]); setCustomer({ name: '', mobile: '', gst: '', address: '' }); setQuery('');
+                    setPaymentMode('Cash'); setPaymentMethod('Cash'); setSplitCash(''); setUdharSite(''); setUdharDueDate(''); setBillDiscount('');
                 } catch (e) {
                     alert('Error: ' + e.message);
                 } finally {
@@ -1148,8 +1212,12 @@
             const totals = useMemo(() => {
                 const subtotal = cart.reduce((s, i) => s + i.total, 0);
                 const gstAmount = billType === 'Tax Invoice' ? cart.reduce((s, i) => s + i.total * ((i.gst || 0) / 100), 0) : 0;
-                return { subtotal, gstAmount, grandTotal: subtotal + gstAmount };
-            }, [cart, billType]);
+                const billDiscountAmt = Math.min(Number(billDiscount) || 0, subtotal + gstAmount);
+                const beforeRound = subtotal + gstAmount - billDiscountAmt;
+                const grandTotal = Math.round(beforeRound);
+                const roundOff = grandTotal - beforeRound;
+                return { subtotal, gstAmount, billDiscount: billDiscountAmt, roundOff, grandTotal };
+            }, [cart, billType, billDiscount]);
 
             return (
                 <div className="flex h-full gap-4 p-4">
@@ -1170,7 +1238,9 @@
                                 <div key={p.id} onClick={() => selectProduct(p)} className={`cursor-pointer border p-3 rounded hover:bg-blue-50 transition flex justify-between items-center ${p.stock < 5 ? 'bg-red-50' : ''}`}>
                                     <div>
                                         <div className="font-bold">{p.name}</div>
-                                        <div className="text-xs text-gray-500">{catLabel(lang || 'en', p.category)}{p.brand ? ' · ' + p.brand : ''} | {p.stock} {unitLabel(lang || 'en', p.unit)}</div>
+                                        <div className="text-xs text-gray-500">{catLabel(lang || 'en', p.category)}{p.brand ? ' · ' + p.brand : ''} | {p.stock} {unitLabel(lang || 'en', p.unit)}
+                                            {p.gstApplicable === false ? <span className="ml-1 text-gray-400">· No GST</span> : <span className="ml-1 text-blue-600">· GST {p.gst || 0}%</span>}
+                                        </div>
                                     </div>
                                     <div className="text-blue-600 font-bold">₹{p.priceSell}</div>
                                 </div>
@@ -1205,6 +1275,14 @@
                                     <p className="text-xs text-red-600 mt-1">Baki ₹{Math.max(0, totals.grandTotal - (Number(splitCash) || 0)).toFixed(2)} Udhar me jayega.</p>
                                 </div>
                             )}
+                            {(paymentMode === 'Cash' || (paymentMode === 'Split' && Number(splitCash) > 0)) && (
+                                <div>
+                                    <label className="text-xs font-bold text-gray-500 block">Payment Kaise Mila?</label>
+                                    <select className="border p-1 rounded w-full text-sm" value={paymentMethod} onChange={e => setPaymentMethod(e.target.value)}>
+                                        {PAYMENT_METHODS.map(m => <option key={m} value={m}>{m}</option>)}
+                                    </select>
+                                </div>
+                            )}
                             <input className="border p-1 rounded w-full text-sm" placeholder={paymentMode !== 'Cash' ? 'Customer Name (zaroori)' : 'Customer Name'} value={customer.name} onChange={e => setCustomer({ ...customer, name: e.target.value })} />
                             {(paymentMode !== 'Cash' || billType === 'Tax Invoice') && (
                                 <div className="flex gap-1">
@@ -1212,6 +1290,22 @@
                                     <input className={`border p-1 rounded text-sm ${billType === 'Tax Invoice' ? 'w-1/3' : 'w-full'}`} placeholder="Mobile" value={customer.mobile} onChange={e => setCustomer({ ...customer, mobile: e.target.value })} />
                                 </div>
                             )}
+                            {paymentMode !== 'Cash' && (
+                                <div className="bg-red-50 border border-red-200 rounded p-2 space-y-1">
+                                    <div>
+                                        <label className="text-xs font-bold text-gray-600 block">Site / Project (optional)</label>
+                                        <input className="border p-1 rounded w-full text-sm" placeholder="e.g. Ram Colony Site" value={udharSite} onChange={e => setUdharSite(e.target.value)} />
+                                    </div>
+                                    <div>
+                                        <label className="text-xs font-bold text-gray-600 block">Payment Kab Tak Dega? (optional)</label>
+                                        <input type="date" className="border p-1 rounded w-full text-sm" value={udharDueDate} onChange={e => setUdharDueDate(e.target.value)} />
+                                    </div>
+                                </div>
+                            )}
+                            <div>
+                                <label className="text-xs font-bold text-gray-500 block">Extra Discount ₹ (poore bill par)</label>
+                                <input type="number" min="0" className="border p-1 rounded w-full text-sm" placeholder="0" value={billDiscount} onChange={e => setBillDiscount(e.target.value)} />
+                            </div>
                             <p className="text-xs text-gray-400">
                                 {billType === 'Tax Invoice'
                                     ? 'Tax Invoice: har item ke GST% ke hisaab se bill me tax apne aap add ho jayega.'
@@ -1234,16 +1328,20 @@
                             </table>
                         </div>
                         <div className="p-4 bg-white border-t">
-                            {billType === 'Tax Invoice' && totals.gstAmount > 0 && (
-                                <div className="text-sm text-gray-500 space-y-0.5 mb-2">
-                                    <div className="flex justify-between"><span>Subtotal</span><span>₹{totals.subtotal.toFixed(2)}</span></div>
-                                    <div className="flex justify-between"><span>CGST</span><span>₹{(totals.gstAmount / 2).toFixed(2)}</span></div>
-                                    <div className="flex justify-between"><span>SGST</span><span>₹{(totals.gstAmount / 2).toFixed(2)}</span></div>
-                                </div>
-                            )}
+                            <div className="text-sm text-gray-500 space-y-0.5 mb-2">
+                                {billType === 'Tax Invoice' && totals.gstAmount > 0 && (
+                                    <>
+                                        <div className="flex justify-between"><span>Subtotal</span><span>₹{totals.subtotal.toFixed(2)}</span></div>
+                                        <div className="flex justify-between"><span>CGST</span><span>₹{(totals.gstAmount / 2).toFixed(2)}</span></div>
+                                        <div className="flex justify-between"><span>SGST</span><span>₹{(totals.gstAmount / 2).toFixed(2)}</span></div>
+                                    </>
+                                )}
+                                {totals.billDiscount > 0 && <div className="flex justify-between text-orange-600"><span>Discount</span><span>− ₹{totals.billDiscount.toFixed(2)}</span></div>}
+                                {Math.abs(totals.roundOff) > 0.001 && <div className="flex justify-between"><span>Round Off</span><span>{totals.roundOff >= 0 ? '+' : ''}₹{totals.roundOff.toFixed(2)}</span></div>}
+                            </div>
                             <div className="flex justify-between items-center mb-4">
                                 <span className="text-gray-500">Total Items: {cart.length}</span>
-                                <span className="text-3xl font-bold text-slate-800">₹{totals.grandTotal.toFixed(2)}</span>
+                                <span className="text-3xl font-bold text-slate-800">₹{totals.grandTotal}</span>
                             </div>
                             <div className="grid grid-cols-2 gap-2">
                                 <button onClick={() => completeSale(false)} disabled={saving} className="w-full bg-slate-700 hover:bg-slate-800 text-white py-3 rounded font-bold shadow disabled:opacity-50">
@@ -1260,12 +1358,22 @@
                     {selectedProd && (
                         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
                             <form onSubmit={addToCart} className="bg-white p-6 rounded shadow-xl w-80">
-                                <h3 className="font-bold text-lg mb-2">{selectedProd.name}</h3>
+                                <h3 className="font-bold text-lg mb-1">{selectedProd.name}</h3>
+                                <div className="flex gap-1 mb-3">
+                                    {selectedProd.gstApplicable === false ? <span className="text-xs bg-gray-100 text-gray-500 px-2 py-0.5 rounded">No GST</span> : <span className="text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded font-bold">GST {selectedProd.gst || 0}%</span>}
+                                    {selectedProd.discountAllowed === false && <span className="text-xs bg-red-100 text-red-700 px-2 py-0.5 rounded font-bold">Fixed Rate</span>}
+                                </div>
                                 <div className="flex justify-between text-sm text-gray-600 mb-4"><span>Stock: {selectedProd.stock}</span><span>Rate: ₹{selectedProd.priceSell}</span></div>
                                 <label className="block text-sm font-bold mb-1">Enter Quantity ({selectedProd.unit})</label>
                                 <input ref={qtyRef} type="number" step="0.01" className="w-full border-2 border-blue-500 rounded p-2 text-2xl font-bold text-center mb-3" value={qtyInput} onChange={e => setQtyInput(e.target.value)} />
-                                <label className="block text-sm font-bold mb-1">Discount % (is sale ke liye)</label>
-                                <input type="number" step="0.01" min="0" max="100" className="w-full border-2 border-orange-400 rounded p-2 text-lg font-bold text-center mb-2" value={discInput} onChange={e => setDiscInput(e.target.value)} />
+                                {selectedProd.discountAllowed !== false ? (
+                                    <>
+                                        <label className="block text-sm font-bold mb-1">Discount % (is sale ke liye)</label>
+                                        <input type="number" step="0.01" min="0" max="100" className="w-full border-2 border-orange-400 rounded p-2 text-lg font-bold text-center mb-2" value={discInput} onChange={e => setDiscInput(e.target.value)} />
+                                    </>
+                                ) : (
+                                    <p className="text-xs text-red-600 mb-2 text-center">Is item par discount allowed nahi hai (Inventory me fixed rate set hai).</p>
+                                )}
                                 {qtyInput && Number(qtyInput) > 0 && (
                                     <p className="text-center text-sm text-gray-600 mb-3">
                                         Final Rate: ₹{(selectedProd.priceSell - selectedProd.priceSell * ((Number(discInput) || 0) / 100)).toFixed(2)} ×  {qtyInput} = <strong>₹{((selectedProd.priceSell - selectedProd.priceSell * ((Number(discInput) || 0) / 100)) * Number(qtyInput)).toFixed(2)}</strong>
@@ -1545,7 +1653,7 @@
         // ============================================================
         const Quotation = ({ products, org }) => {
             const [qItems, setQItems] = useState([]);
-            const [qCust, setQCust] = useState({ name: '', date: new Date().toISOString().split('T')[0] });
+            const [qCust, setQCust] = useState({ name: '', mobile: '', address: '', date: new Date().toISOString().split('T')[0] });
             const [manualItem, setManualItem] = useState({ name: '', unit: 'Pcs', price: '', qty: '' });
             const [rec, setRec] = useState([]);
 
@@ -1581,6 +1689,8 @@
                         <div className="grid grid-cols-2 gap-4 mb-6">
                             <input className="border p-2 rounded" placeholder="Customer Name" value={qCust.name} onChange={e => setQCust({ ...qCust, name: e.target.value })} />
                             <input type="date" className="border p-2 rounded" value={qCust.date} onChange={e => setQCust({ ...qCust, date: e.target.value })} />
+                            <input className="border p-2 rounded" placeholder="Mobile Number" value={qCust.mobile} onChange={e => setQCust({ ...qCust, mobile: e.target.value })} />
+                            <input className="border p-2 rounded" placeholder="Site / Delivery Address" value={qCust.address} onChange={e => setQCust({ ...qCust, address: e.target.value })} />
                         </div>
                         <div className="bg-gray-50 p-4 rounded mb-6 relative">
                             <h4 className="font-bold mb-2 text-sm text-gray-600">Add Item (Stock or Manual)</h4>
@@ -1845,6 +1955,8 @@
             const [txns, setTxns] = useState([]);
             const [payAmount, setPayAmount] = useState('');
             const [payNote, setPayNote] = useState('');
+            const [paySite, setPaySite] = useState('');
+            const [payDueDate, setPayDueDate] = useState('');
             const [showNewParty, setShowNewParty] = useState(false);
             const [newParty, setNewParty] = useState({ name: '', mobile: '', opening: '' });
             const [showReturn, setShowReturn] = useState(false);
@@ -1852,6 +1964,7 @@
             const [returnProd, setReturnProd] = useState(null);
             const [returnQty, setReturnQty] = useState('');
             const [returnBusy, setReturnBusy] = useState(false);
+            const [siteFilter, setSiteFilter] = useState('All');
 
             const partiesRef = db.collection('orgs').doc(orgId).collection('parties');
 
@@ -1864,7 +1977,8 @@
 
             useEffect(() => {
                 if (!openParty) { setTxns([]); return; }
-                const unsub = partiesRef.doc(openParty.id).collection('transactions').orderBy('createdAt', 'desc').limit(50).onSnapshot(snap => {
+                setSiteFilter('All');
+                const unsub = partiesRef.doc(openParty.id).collection('transactions').orderBy('createdAt', 'desc').limit(200).onSnapshot(snap => {
                     setTxns(snap.docs.map(d => ({ id: d.id, ...d.data() })));
                 });
                 return unsub;
@@ -1874,6 +1988,23 @@
                 .sort((a, b) => (b.balance || 0) - (a.balance || 0));
 
             const totalOutstanding = parties.reduce((s, p) => s + (p.balance || 0), 0);
+
+            // Group this party's transactions by "site" so a contractor with
+            // multiple sites can be reviewed site-by-site, with an overall total too.
+            const siteGroups = useMemo(() => {
+                const map = {};
+                txns.forEach(t => {
+                    const key = t.site || 'General (No Site)';
+                    if (!map[key]) map[key] = { site: key, credit: 0, debit: 0, txns: [] };
+                    if (t.type === 'sale_credit' || t.type === 'purchase_credit' || (t.type === 'opening_balance' && t.amount > 0)) map[key].credit += t.amount;
+                    else map[key].debit += t.amount;
+                    map[key].txns.push(t);
+                });
+                return Object.values(map).sort((a, b) => a.site.localeCompare(b.site));
+            }, [txns]);
+
+            const siteNames = ['All', ...siteGroups.map(g => g.site)];
+            const visibleTxns = siteFilter === 'All' ? txns : (siteGroups.find(g => g.site === siteFilter) || { txns: [] }).txns;
 
             const addManualTxn = async (isCredit) => {
                 // isCredit: customer -> "Udhar Diya" (+) / supplier -> "Udhar Liya" (+)
@@ -1886,11 +2017,18 @@
                     : (isCredit ? 'purchase_credit' : 'payment_made');
                 await partiesRef.doc(openParty.id).update({ balance: FieldValue.increment(sign * amt) });
                 await partiesRef.doc(openParty.id).collection('transactions').add({
-                    type, amount: amt, note: payNote || '',
+                    type, amount: amt, note: payNote || '', site: isCredit ? (paySite || '') : '', dueDate: isCredit ? (payDueDate || null) : null,
                     date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp(),
                     staffUid: firebaseUser.uid, staffName: userDoc.name
                 });
-                setPayAmount(''); setPayNote('');
+                if (isCredit && payDueDate) {
+                    await db.collection('orgs').doc(orgId).collection('dueReminders').add({
+                        partyId: openParty.id, partyName: openParty.name, partyType: tab,
+                        site: paySite || '', amount: amt, dueDate: payDueDate, note: payNote || '',
+                        resolved: false, createdAt: FieldValue.serverTimestamp()
+                    });
+                }
+                setPayAmount(''); setPayNote(''); setPaySite(''); setPayDueDate('');
             };
 
             const createParty = async (e) => {
@@ -1943,6 +2081,32 @@
 
             const returnProdMatches = returnProdQuery.length > 1 ? products.filter(p => p.name.toLowerCase().includes(returnProdQuery.toLowerCase())).slice(0, 6) : [];
 
+            const downloadPartyPDF = () => {
+                const doc = new window.jspdf.jsPDF();
+                const currentBalance = (parties.find(p => p.id === openParty.id) || openParty).balance || 0;
+                doc.setFontSize(14);
+                doc.text(`${openParty.name} — Khata Statement`, 14, 15);
+                doc.setFontSize(9);
+                doc.text(`Mobile: ${openParty.mobile || '-'} · Type: ${tab === 'customer' ? 'Customer' : 'Supplier'}`, 14, 21);
+                doc.text(`Current Balance: Rs.${currentBalance.toLocaleString()}`, 14, 26);
+                let y = 32;
+                siteGroups.forEach(g => {
+                    doc.setFontSize(10);
+                    doc.text(`Site: ${g.site} — Total Given: Rs.${g.credit.toFixed(2)} | Total Paid: Rs.${g.debit.toFixed(2)} | Balance: Rs.${(g.credit - g.debit).toFixed(2)}`, 14, y);
+                    y += 4;
+                    doc.autoTable({
+                        startY: y,
+                        head: [['Date', 'Type', 'Note', 'Amount']],
+                        body: g.txns.slice().reverse().map(t => [new Date(t.date).toLocaleDateString(), txnLabel[t.type] || t.type, t.note || '', 'Rs.' + t.amount.toFixed(2)]),
+                        styles: { fontSize: 8 },
+                        margin: { left: 14 }
+                    });
+                    y = doc.lastAutoTable.finalY + 8;
+                });
+                doc.save(`${openParty.name.replace(/\s+/g, '_')}_khata.pdf`);
+            };
+
+
             const txnLabel = { sale_credit: 'Udhar Diya', purchase_credit: 'Udhar Liya', payment_received: 'Payment Mila', payment_made: 'Payment Diya', opening_balance: 'Opening Balance', purchase_return: 'Maal Wapas (Return)' };
 
             return (
@@ -1972,7 +2136,7 @@
                     <div className="bg-white rounded shadow overflow-hidden">
                         {filtered.length === 0 && <div className="p-4 text-center text-gray-500">Koi record nahi hai.</div>}
                         {filtered.map(p => (
-                            <div key={p.id} onClick={() => { setOpenParty(p); setShowReturn(false); setReturnProd(null); setReturnQty(''); setReturnProdQuery(''); }} className="flex justify-between items-center p-3 border-b hover:bg-gray-50 cursor-pointer">
+                            <div key={p.id} onClick={() => { setOpenParty(p); setShowReturn(false); setReturnProd(null); setReturnQty(''); setReturnProdQuery(''); setPaySite(''); setPayDueDate(''); }} className="flex justify-between items-center p-3 border-b hover:bg-gray-50 cursor-pointer">
                                 <div><div className="font-bold">{p.name}</div><div className="text-xs text-gray-500">{p.mobile}</div></div>
                                 <div className={`font-bold ${(p.balance || 0) > 0 ? 'text-red-600' : 'text-green-600'}`}>₹{(p.balance || 0).toLocaleString()}</div>
                             </div>
@@ -2001,7 +2165,10 @@
                             <div className="bg-white rounded shadow-xl w-full max-w-lg max-h-[90vh] flex flex-col">
                                 <div className="p-4 border-b flex justify-between items-center">
                                     <div><h3 className="font-bold text-lg">{openParty.name}</h3><p className="text-xs text-gray-500">{openParty.mobile}</p></div>
-                                    <button onClick={() => setOpenParty(null)} className="text-gray-400 text-xl">&times;</button>
+                                    <div className="flex items-center gap-2">
+                                        <button onClick={downloadPartyPDF} className="text-xs bg-red-100 text-red-700 px-2 py-1 rounded font-bold">PDF</button>
+                                        <button onClick={() => setOpenParty(null)} className="text-gray-400 text-xl">&times;</button>
+                                    </div>
                                 </div>
                                 <div className={`p-3 text-center font-bold text-white ${(parties.find(p => p.id === openParty.id) || openParty).balance > 0 ? 'bg-red-600' : 'bg-green-600'}`}>
                                     Balance: ₹{((parties.find(p => p.id === openParty.id) || openParty).balance || 0).toLocaleString()}
@@ -2011,6 +2178,10 @@
                                     <div className="flex gap-2 mb-2">
                                         <input type="number" className="border p-2 rounded flex-1" placeholder="Amount ₹" value={payAmount} onChange={e => setPayAmount(e.target.value)} />
                                         <input className="border p-2 rounded flex-1" placeholder="Note (optional)" value={payNote} onChange={e => setPayNote(e.target.value)} />
+                                    </div>
+                                    <div className="flex gap-2 mb-2">
+                                        <input className="border p-2 rounded flex-1 text-sm" placeholder="Site / Project (Udhar Diya/Liya ke liye)" value={paySite} onChange={e => setPaySite(e.target.value)} />
+                                        <input type="date" className="border p-2 rounded text-sm" placeholder="Due Date" value={payDueDate} onChange={e => setPayDueDate(e.target.value)} title="Payment kab tak" />
                                     </div>
                                     <div className="grid grid-cols-2 gap-2">
                                         <button onClick={() => addManualTxn(true)} className="bg-red-100 text-red-700 p-2 rounded font-bold text-sm">
@@ -2053,20 +2224,30 @@
                                     )}
                                 </div>
 
+                                {siteGroups.length > 1 && (
+                                    <div className="px-4 pt-2 flex flex-wrap gap-1 border-b pb-2">
+                                        {siteNames.map(s => (
+                                            <button key={s} onClick={() => setSiteFilter(s)} className={`px-2 py-1 rounded text-xs border ${siteFilter === s ? 'bg-slate-800 text-white' : 'bg-white text-gray-600'}`}>
+                                                {s}{s !== 'All' ? ` (₹${((siteGroups.find(g => g.site === s) || {}).credit - (siteGroups.find(g => g.site === s) || {}).debit || 0).toLocaleString()})` : ''}
+                                            </button>
+                                        ))}
+                                    </div>
+                                )}
+
                                 <div className="flex-1 overflow-auto p-4">
-                                    <h4 className="font-bold text-sm text-gray-500 mb-2">History</h4>
-                                    {txns.map(t => (
+                                    <h4 className="font-bold text-sm text-gray-500 mb-2">History {siteFilter !== 'All' ? `— ${siteFilter}` : ''}</h4>
+                                    {visibleTxns.map(t => (
                                         <div key={t.id} className="flex justify-between items-center border-b py-2 text-sm">
                                             <div>
-                                                <div className="font-bold">{txnLabel[t.type] || t.type}</div>
-                                                <div className="text-xs text-gray-500">{t.note} · {new Date(t.date).toLocaleDateString()}</div>
+                                                <div className="font-bold">{txnLabel[t.type] || t.type}{t.site ? <span className="text-xs text-gray-400 font-normal"> · {t.site}</span> : ''}</div>
+                                                <div className="text-xs text-gray-500">{t.note} · {new Date(t.date).toLocaleDateString()}{t.dueDate ? ` · Due: ${new Date(t.dueDate).toLocaleDateString()}` : ''}</div>
                                             </div>
                                             <div className={`font-bold ${(t.type === 'sale_credit' || t.type === 'purchase_credit' || (t.type === 'opening_balance' && t.amount > 0)) ? 'text-red-600' : 'text-green-600'}`}>
                                                 ₹{t.amount.toLocaleString()}
                                             </div>
                                         </div>
                                     ))}
-                                    {txns.length === 0 && <p className="text-center text-gray-400 text-sm">Koi transaction nahi hai.</p>}
+                                    {visibleTxns.length === 0 && <p className="text-center text-gray-400 text-sm">Koi transaction nahi hai.</p>}
                                 </div>
                             </div>
                         </div>
@@ -2173,6 +2354,63 @@
         };
 
         // ============================================================
+        // DUE REMINDERS BANNER (visible to everyone, owner + staff both)
+        // "Kis customer/supplier se kab paisa lena/dena hai" reminder strip.
+        // ============================================================
+        const DueRemindersBanner = ({ orgId, dueReminders }) => {
+            const [expanded, setExpanded] = useState(false);
+
+            const today = new Date().toISOString().split('T')[0];
+            const sorted = [...dueReminders].sort((a, b) => (a.dueDate || '').localeCompare(b.dueDate || ''));
+            const overdue = sorted.filter(r => r.dueDate < today);
+            const dueSoon = sorted.filter(r => r.dueDate >= today && r.dueDate <= new Date(Date.now() + 3 * 86400000).toISOString().split('T')[0]);
+            const upcoming = sorted.filter(r => r.dueDate > new Date(Date.now() + 3 * 86400000).toISOString().split('T')[0]);
+
+            if (sorted.length === 0) return null;
+
+            const markCollected = async (r) => {
+                await db.collection('orgs').doc(orgId).collection('dueReminders').doc(r.id).update({ resolved: true, resolvedAt: FieldValue.serverTimestamp() });
+            };
+
+            const daysDiff = (dateStr) => Math.round((new Date(dateStr) - new Date(today)) / 86400000);
+
+            const Row = ({ r }) => (
+                <div className="flex justify-between items-center py-2 border-b last:border-b-0">
+                    <div>
+                        <span className="font-bold">{r.partyName}</span>
+                        <span className={`ml-2 text-xs px-1.5 py-0.5 rounded ${r.partyType === 'customer' ? 'bg-green-100 text-green-700' : 'bg-blue-100 text-blue-700'}`}>{r.partyType === 'customer' ? 'Se Lena Hai' : 'Ko Dena Hai'}</span>
+                        {r.site && <span className="ml-1 text-xs text-gray-400">· {r.site}</span>}
+                        <div className="text-xs text-gray-500">{r.note} · Due: {new Date(r.dueDate).toLocaleDateString()} ({daysDiff(r.dueDate) < 0 ? `${-daysDiff(r.dueDate)} din overdue` : daysDiff(r.dueDate) === 0 ? 'Aaj' : `${daysDiff(r.dueDate)} din baaki`})</div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                        <span className="font-bold">₹{r.amount.toLocaleString()}</span>
+                        <button onClick={() => markCollected(r)} className="text-xs bg-gray-100 hover:bg-gray-200 px-2 py-1 rounded">✓ Ho Gaya</button>
+                    </div>
+                </div>
+            );
+
+            return (
+                <div className="no-print bg-white border-b-2 border-red-300 px-4 py-2">
+                    <div className="flex justify-between items-center cursor-pointer" onClick={() => setExpanded(!expanded)}>
+                        <div className="flex items-center gap-3">
+                            <span className="font-bold text-red-700">🔔 Udhar Reminders</span>
+                            {overdue.length > 0 && <span className="text-xs bg-red-600 text-white px-2 py-0.5 rounded-full font-bold">{overdue.length} Overdue</span>}
+                            {dueSoon.length > 0 && <span className="text-xs bg-yellow-500 text-white px-2 py-0.5 rounded-full font-bold">{dueSoon.length} Due Soon</span>}
+                        </div>
+                        <span className="text-xs text-gray-400">{expanded ? 'Chhupao ▲' : 'Dikhao ▼'}</span>
+                    </div>
+                    {expanded && (
+                        <div className="mt-2 max-h-64 overflow-auto">
+                            {overdue.map(r => <Row key={r.id} r={r} />)}
+                            {dueSoon.map(r => <Row key={r.id} r={r} />)}
+                            {upcoming.map(r => <Row key={r.id} r={r} />)}
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        // ============================================================
         // MAIN APP (post-login, active org member)
         // ============================================================
         const MainApp = ({ firebaseUser, userDoc }) => {
@@ -2180,6 +2418,7 @@
             const [org, setOrg] = useState(null);
             const [products, setProducts] = useState([]);
             const [sales, setSales] = useState([]);
+            const [dueReminders, setDueReminders] = useState([]);
             const [lang, setLang] = useState(() => localStorage.getItem('buildmart_lang') || 'en');
             const orgId = userDoc.orgId;
             const isAdmin = userDoc.role === 'owner' || userDoc.role === 'admin';
@@ -2199,7 +2438,8 @@
                 const unsubOrg = db.collection('orgs').doc(orgId).onSnapshot(d => setOrg({ id: d.id, ...d.data() }));
                 const unsubProd = db.collection('orgs').doc(orgId).collection('products').orderBy('name').onSnapshot(snap => setProducts(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
                 const unsubSales = db.collection('orgs').doc(orgId).collection('sales').orderBy('date').onSnapshot(snap => setSales(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
-                return () => { unsubOrg(); unsubProd(); unsubSales(); };
+                const unsubDue = db.collection('orgs').doc(orgId).collection('dueReminders').where('resolved', '==', false).onSnapshot(snap => setDueReminders(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
+                return () => { unsubOrg(); unsubProd(); unsubSales(); unsubDue(); };
             }, [orgId]);
 
             useEffect(() => {
@@ -2255,6 +2495,7 @@
                     </div>
 
                     <div className="flex-1 bg-gray-100 h-full overflow-hidden flex flex-col">
+                        <DueRemindersBanner orgId={orgId} dueReminders={dueReminders} />
                         {view === 'dashboard' && canDashboard && <Dashboard sales={sales} products={products} lang={lang} />}
                         {view === 'pos' && canPOS && <POS orgId={orgId} org={org} products={products} userDoc={userDoc} firebaseUser={firebaseUser} lang={lang} />}
                         {view === 'inventory' && canInventory && <Inventory orgId={orgId} products={products} isAdmin={isAdmin} lang={lang} />}
@@ -2356,8 +2597,14 @@
                         <div style="display:flex; justify-content:space-between; font-size:10px;"><span>CGST</span><span>₹${(data.gstAmount / 2).toFixed(2)}</span></div>
                         <div style="display:flex; justify-content:space-between; font-size:10px;"><span>SGST</span><span>₹${(data.gstAmount / 2).toFixed(2)}</span></div>
                         ` : ''}
+                        ${data.billDiscount > 0 ? `<div style="display:flex; justify-content:space-between; font-size:10px;"><span>Discount</span><span>-₹${data.billDiscount.toFixed(2)}</span></div>` : ''}
+                        ${Math.abs(data.roundOff || 0) > 0.001 ? `<div style="display:flex; justify-content:space-between; font-size:10px;"><span>Round Off</span><span>${data.roundOff >= 0 ? '+' : ''}₹${data.roundOff.toFixed(2)}</span></div>` : ''}
                         <div style="text-align:right; font-weight:bold; font-size:14px;">Total: ₹${(data.grandTotal || 0).toFixed(2)}</div>
+                        ${data.paymentMethod ? `<div style="font-size:10px;">Paid via: ${data.paymentMethod}</div>` : ''}
+                        ${data.site ? `<div style="font-size:10px;">Site: ${data.site}</div>` : ''}
+                        ${data.dueDate ? `<div style="font-size:10px;">Payment Due: ${new Date(data.dueDate).toLocaleDateString()}</div>` : ''}
                         ${data.paymentMode === 'Udhar' ? '<div style="text-align:center; font-weight:bold; font-size:12px; border:1px dashed #000; padding:3px; margin-top:4px;">** UDHAR - PAYMENT PENDING **</div>' : ''}
+                        ${data.paymentMode === 'Split' ? `<div style="text-align:center; font-weight:bold; font-size:11px; border:1px dashed #000; padding:3px; margin-top:4px;">Paid: ₹${(data.cashAmount || 0).toFixed(2)} · Udhar: ₹${(data.udharAmount || 0).toFixed(2)}</div>` : ''}
                         <center style="margin-top:10px; font-size:10px;">** Thank You Visit Again **</center>
                     </div>`;
             }
@@ -2379,6 +2626,7 @@
                     <div style="margin:20px 0; padding:10px; background:#f5f5f5; border-radius:5px;">
                         <strong>To:</strong> ${data.customer.name}<br>
                         ${data.customer.address ? data.customer.address + '<br>' : ''}
+                        ${data.customer.mobile ? 'Mob: ' + data.customer.mobile + '<br>' : ''}
                         ${data.customer.gst ? 'GSTIN: ' + data.customer.gst : ''}
                     </div>
                     <table style="width:100%; border-collapse:collapse; margin-top:20px;">
