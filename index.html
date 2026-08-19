@@ -1,0 +1,1754 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>BuildMart POS - Hardware & Building Material SaaS</title>
+
+    <!-- React & Tailwind -->
+    <script crossorigin src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script crossorigin src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+
+    <!-- Firebase (compat SDK - works with plain <script> tags, no bundler needed) -->
+    <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-app-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-auth-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore-compat.js"></script>
+    <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-analytics-compat.js"></script>
+
+    <style>
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
+        body { font-family: 'Inter', sans-serif; background: #f3f4f6; }
+        ::-webkit-scrollbar { width: 6px; height: 6px; }
+        ::-webkit-scrollbar-track { background: #f1f1f1; }
+        ::-webkit-scrollbar-thumb { background: #888; border-radius: 3px; }
+
+        @media print {
+            .no-print { display: none !important; }
+            body { background: white; margin: 0; padding: 0; }
+            .print-thermal { display: block !important; width: 72mm; margin: 0; padding: 5px; font-size: 12px; font-family: 'Courier New', monospace; }
+            .print-a4 { display: block !important; width: 210mm; min-height: 297mm; padding: 20mm; font-size: 14px; }
+            #root > div { display: none; }
+        }
+        .print-area { display: none; }
+    </style>
+</head>
+<body>
+    <div id="root"></div>
+    <div id="print-content" class="print-area"></div>
+
+    <!-- ============================================================
+         STEP 1: PASTE YOUR FIREBASE CONFIG HERE
+         (Firebase Console → Project Settings → General → Your apps → SDK config)
+         ============================================================ -->
+    <script>
+        window.FIREBASE_CONFIG = {
+            apiKey: "AIzaSyDY90NGWdHLvKQ0HHKjz36Egf0VjX8KDNo",
+            authDomain: "mirza-traders.firebaseapp.com",
+            projectId: "mirza-traders",
+            storageBucket: "mirza-traders.firebasestorage.app",
+            messagingSenderId: "726531584279",
+            appId: "1:726531584279:web:0199360a64b638362a8752",
+            measurementId: "G-CSYZBGQ0R3"
+        };
+    </script>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useMemo } = React;
+
+        firebase.initializeApp(window.FIREBASE_CONFIG);
+        const auth = firebase.auth();
+        const db = firebase.firestore();
+        const FieldValue = firebase.firestore.FieldValue;
+        try { firebase.analytics(); } catch (e) { /* analytics not available (e.g. localhost) - safe to ignore */ }
+
+        const CATEGORIES = ['Hardware', 'Plumbing', 'Cement', 'Steel', 'Bath Fitting', 'AAC Blocks', 'Electrical', 'Paint', 'Other'];
+        const UNITS = ['Pcs', 'Bags', 'Kg', 'Ton', 'Feet', 'Meter', 'Box', 'Litr'];
+        const EXPENSE_CATEGORIES = ['Rent', 'Salary/Wages', 'Transport/Loading', 'Electricity Bill', 'Shop Maintenance', 'Other'];
+
+        // ============================================================
+        // BUILDING MATERIAL CATALOG — common items/brands/sizes so staff
+        // don't have to type the same material from scratch every time.
+        // (English keys stay canonical in the database; display labels
+        // are translated separately via CATEGORY_LABELS/UNIT_LABELS.)
+        // ============================================================
+        const CATALOG = {
+            'Cement': {
+                unit: 'Bags', gst: 28,
+                items: ['Cement OPC 43', 'Cement OPC 53', 'Cement PPC', 'White Cement'],
+                brands: ['UltraTech', 'ACC', 'Ambuja', 'Shree Cement', 'JK Cement', 'Birla Corp', 'Ramco', 'Dalmia', 'JK White'],
+                specs: ['50kg Bag', '25kg Bag']
+            },
+            'Steel': {
+                unit: 'Kg', gst: 18,
+                items: ['TMT Steel Bar', 'MS Angle', 'MS Flat', 'MS Pipe', 'Binding Wire', 'MS Channel'],
+                brands: ['Tata Tiscon', 'JSW Neosteel', 'SAIL', 'Kamdhenu', 'Rathi', 'Vizag Steel', 'Local'],
+                specs: ['6mm', '8mm', '10mm', '12mm', '16mm', '20mm', '25mm', '32mm']
+            },
+            'Hardware': {
+                unit: 'Pcs', gst: 18,
+                items: ['Nails / Khile', 'Screws', 'Door Hinges', 'Tower Bolt', 'Door Handle', 'Padlock', 'M-Seal', 'Measuring Tape', 'Hammer', 'Wire Mesh', 'Rope/Dori'],
+                brands: ['Local', 'Godrej', 'Yale', 'Dorset', 'Everest'],
+                specs: ['1 inch', '1.5 inch', '2 inch', '3 inch', '4 inch', '6 inch']
+            },
+            'Plumbing': {
+                unit: 'Feet', gst: 18,
+                items: ['CPVC Pipe', 'PVC Pipe', 'Elbow', 'Tee Joint', 'Coupler', 'Ball Valve', 'Bib Cock', 'Flush Tank', 'PTFE Tape', 'Drain Pipe'],
+                brands: ['Astral', 'Finolex', 'Supreme', 'Prince', 'Ashirvad'],
+                specs: ['1/2 inch', '3/4 inch', '1 inch', '1.25 inch', '1.5 inch', '2 inch', '4 inch']
+            },
+            'Paint': {
+                unit: 'Litr', gst: 18,
+                items: ['Interior Emulsion', 'Exterior Emulsion', 'Enamel Paint', 'Primer', 'Distemper', 'Wall Putty', 'Wood Polish', 'Texture Paint'],
+                brands: ['Asian Paints', 'Berger', 'Nerolac', 'Dulux', 'JK Wall Putty', 'Birla White Putty'],
+                specs: ['1 Litr', '4 Litr', '10 Litr', '20 Litr', '1 Kg', '5 Kg', '25 Kg', '40 Kg']
+            },
+            'Electrical': {
+                unit: 'Pcs', gst: 18,
+                items: ['Copper Wire', 'MCB', 'Switch', 'Socket', 'LED Bulb', 'Tube Light', 'Ceiling Fan', 'Extension Board', 'Switch Board', 'Wire Roll'],
+                brands: ['Havells', 'Anchor', 'Polycab', 'Finolex', 'Philips', 'Crompton', 'V-Guard'],
+                specs: ['0.75 sqmm', '1 sqmm', '1.5 sqmm', '2.5 sqmm', '4 sqmm', '6 sqmm', '6A', '16A', '32A', '9W', '12W', '18W']
+            },
+            'Bath Fitting': {
+                unit: 'Pcs', gst: 12,
+                items: ['Bib Cock', 'Angle Valve', 'Health Faucet', 'Shower', 'Wash Basin', 'Commode / WC', 'Basin Mixer', 'Kitchen Sink'],
+                brands: ['Jaguar', 'Cera', 'Hindware', 'Parryware', 'Kohler'],
+                specs: ['Standard']
+            },
+            'AAC Blocks': {
+                unit: 'Pcs', gst: 5,
+                items: ['AAC Block'],
+                brands: ['Siporex', 'Magicrete', 'Biltech', 'Aerocon'],
+                specs: ['4 inch', '6 inch', '8 inch', '9 inch']
+            }
+        };
+
+        // ============================================================
+        // MULTI-LANGUAGE (English / Hindi / Marathi)
+        // Category & Unit values stay English in the database (canonical
+        // keys used by the catalog above); only their on-screen labels change.
+        // ============================================================
+        const LANGUAGES = { en: 'English', hi: 'हिंदी', mr: 'मराठी' };
+
+        const CATEGORY_LABELS = {
+            en: { 'Hardware': 'Hardware', 'Plumbing': 'Plumbing', 'Cement': 'Cement', 'Steel': 'Steel', 'Bath Fitting': 'Bath Fitting', 'AAC Blocks': 'AAC Blocks', 'Electrical': 'Electrical', 'Paint': 'Paint', 'Other': 'Other' },
+            hi: { 'Hardware': 'हार्डवेयर', 'Plumbing': 'प्लंबिंग', 'Cement': 'सीमेंट', 'Steel': 'सरिया/स्टील', 'Bath Fitting': 'बाथ फिटिंग', 'AAC Blocks': 'AAC ब्लॉक', 'Electrical': 'इलेक्ट्रिकल', 'Paint': 'पेंट', 'Other': 'अन्य' },
+            mr: { 'Hardware': 'हार्डवेअर', 'Plumbing': 'प्लंबिंग', 'Cement': 'सिमेंट', 'Steel': 'सळई/स्टील', 'Bath Fitting': 'बाथ फिटिंग', 'AAC Blocks': 'AAC ब्लॉक', 'Electrical': 'इलेक्ट्रिकल', 'Paint': 'पेंट', 'Other': 'इतर' }
+        };
+        const UNIT_LABELS = {
+            en: { 'Pcs': 'Pcs', 'Bags': 'Bags', 'Kg': 'Kg', 'Ton': 'Ton', 'Feet': 'Feet', 'Meter': 'Meter', 'Box': 'Box', 'Litr': 'Litre' },
+            hi: { 'Pcs': 'नग', 'Bags': 'बोरी', 'Kg': 'किलो', 'Ton': 'टन', 'Feet': 'फुट', 'Meter': 'मीटर', 'Box': 'बॉक्स', 'Litr': 'लीटर' },
+            mr: { 'Pcs': 'नग', 'Bags': 'पोती', 'Kg': 'किलो', 'Ton': 'टन', 'Feet': 'फूट', 'Meter': 'मीटर', 'Box': 'बॉक्स', 'Litr': 'लिटर' }
+        };
+        function catLabel(lang, val) { return (CATEGORY_LABELS[lang] && CATEGORY_LABELS[lang][val]) || val; }
+        function unitLabel(lang, val) { return (UNIT_LABELS[lang] && UNIT_LABELS[lang][val]) || val; }
+
+        const TRANSLATIONS = {
+            en: {
+                nav_dashboard: 'Dashboard', nav_pos: 'Counter Billing (POS)', nav_quotation: 'Quotation (A4)',
+                nav_inventory: 'Inventory', nav_khata: 'Udhar Khata', nav_reports: 'Sales Reports',
+                nav_profit: 'Profit & Loss', nav_users: 'User Management', nav_settings: 'Settings', nav_logout: 'Logout',
+                inv_addNew: 'Add New Material', inv_restocking: 'Restocking', inv_newProduct: 'New Product',
+                inv_quickPick: 'Quick Pick (Common Items)', inv_brand: 'Brand / Company', inv_spec: 'Size / Type',
+                inv_other: 'Other (type manually)', inv_productName: 'Product Name (type or pick below)',
+                inv_category: 'Category', inv_unit: 'Unit', inv_purchaseRate: 'Purchase Rate (₹)',
+                inv_sellRate: 'Sell Rate (₹)', inv_initialStock: 'Initial Stock', inv_addStockQty: 'Add Stock (Qty)',
+                inv_gst: 'GST %', inv_disc: 'Disc %', inv_addBtn: 'Add New (Enter)', inv_addStockBtn: 'Add Stock (Enter)',
+                inv_list: 'Inventory List', inv_search: 'Search...', inv_name: 'Name', inv_stock: 'Stock',
+                inv_sellRateCol: 'Sell Rate', inv_discCol: 'Disc%', inv_action: 'Action', inv_delete: 'Delete',
+                inv_purchaseVia: 'Ye purchase kaise hui?', inv_cash: 'Cash Purchase', inv_udhar: 'Udhar (Supplier Credit)',
+                inv_supplierName: 'Supplier Name', inv_supplierMobile: 'Supplier Mobile'
+            },
+            hi: {
+                nav_dashboard: 'डैशबोर्ड', nav_pos: 'बिलिंग (POS)', nav_quotation: 'कोटेशन (A4)',
+                nav_inventory: 'इन्वेंटरी', nav_khata: 'उधार खाता', nav_reports: 'सेल्स रिपोर्ट',
+                nav_profit: 'लाभ और हानि', nav_users: 'यूजर मैनेजमेंट', nav_settings: 'सेटिंग्स', nav_logout: 'लॉगआउट',
+                inv_addNew: 'नया माल जोड़ें', inv_restocking: 'स्टॉक बढ़ाएं', inv_newProduct: 'नया प्रोडक्ट',
+                inv_quickPick: 'क्विक पिक (सामान्य आइटम)', inv_brand: 'ब्रांड / कंपनी', inv_spec: 'साइज़ / टाइप',
+                inv_other: 'अन्य (खुद टाइप करें)', inv_productName: 'प्रोडक्ट का नाम (टाइप करें या नीचे से चुनें)',
+                inv_category: 'श्रेणी', inv_unit: 'यूनिट', inv_purchaseRate: 'खरीद रेट (₹)',
+                inv_sellRate: 'बिक्री रेट (₹)', inv_initialStock: 'शुरुआती स्टॉक', inv_addStockQty: 'स्टॉक जोड़ें (मात्रा)',
+                inv_gst: 'जीएसटी %', inv_disc: 'छूट %', inv_addBtn: 'जोड़ें (Enter)', inv_addStockBtn: 'स्टॉक जोड़ें (Enter)',
+                inv_list: 'इन्वेंटरी लिस्ट', inv_search: 'खोजें...', inv_name: 'नाम', inv_stock: 'स्टॉक',
+                inv_sellRateCol: 'बिक्री रेट', inv_discCol: 'छूट%', inv_action: 'कार्रवाई', inv_delete: 'हटाएं',
+                inv_purchaseVia: 'यह खरीद कैसे हुई?', inv_cash: 'नकद खरीद', inv_udhar: 'उधार (सप्लायर क्रेडिट)',
+                inv_supplierName: 'सप्लायर का नाम', inv_supplierMobile: 'सप्लायर मोबाइल'
+            },
+            mr: {
+                nav_dashboard: 'डॅशबोर्ड', nav_pos: 'बिलिंग (POS)', nav_quotation: 'कोटेशन (A4)',
+                nav_inventory: 'इन्व्हेंटरी', nav_khata: 'उधारी खाते', nav_reports: 'विक्री अहवाल',
+                nav_profit: 'नफा-तोटा', nav_users: 'युजर मॅनेजमेंट', nav_settings: 'सेटिंग्ज', nav_logout: 'लॉगआउट',
+                inv_addNew: 'नवीन माल जोडा', inv_restocking: 'स्टॉक वाढवा', inv_newProduct: 'नवीन प्रोडक्ट',
+                inv_quickPick: 'क्विक पिक (सामान्य वस्तू)', inv_brand: 'ब्रँड / कंपनी', inv_spec: 'साइज़ / प्रकार',
+                inv_other: 'इतर (स्वतः टाइप करा)', inv_productName: 'प्रोडक्टचे नाव (टाइप करा किंवा खालून निवडा)',
+                inv_category: 'प्रकार', inv_unit: 'युनिट', inv_purchaseRate: 'खरेदी दर (₹)',
+                inv_sellRate: 'विक्री दर (₹)', inv_initialStock: 'सुरुवातीचा स्टॉक', inv_addStockQty: 'स्टॉक जोडा (प्रमाण)',
+                inv_gst: 'जीएसटी %', inv_disc: 'सूट %', inv_addBtn: 'जोडा (Enter)', inv_addStockBtn: 'स्टॉक जोडा (Enter)',
+                inv_list: 'इन्व्हेंटरी यादी', inv_search: 'शोधा...', inv_name: 'नाव', inv_stock: 'स्टॉक',
+                inv_sellRateCol: 'विक्री दर', inv_discCol: 'सूट%', inv_action: 'कृती', inv_delete: 'काढा',
+                inv_purchaseVia: 'ही खरेदी कशी झाली?', inv_cash: 'रोख खरेदी', inv_udhar: 'उधारी (सप्लायर क्रेडिट)',
+                inv_supplierName: 'सप्लायरचे नाव', inv_supplierMobile: 'सप्लायर मोबाइल'
+            }
+        };
+        function t(lang, key) { return (TRANSLATIONS[lang] && TRANSLATIONS[lang][key]) || TRANSLATIONS.en[key] || key; }
+
+        function genInviteCode() {
+            const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+            let code = '';
+            for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
+            return code;
+        }
+
+        // Default permissions given to a newly-approved "staff" user.
+        // Owner/Admin always get full access regardless of this object.
+        function defaultPermissions() {
+            return { pos: true, inventory: true, reports: false, profit: false, khata: false, dashboard: false };
+        }
+
+        // ============================================================
+        // 1. LOGIN (Google Sign-In)
+        // ============================================================
+        const Login = () => {
+            const [busy, setBusy] = useState(false);
+            const [err, setErr] = useState('');
+
+            const handleGoogleLogin = async () => {
+                setErr('');
+                setBusy(true);
+                try {
+                    const provider = new firebase.auth.GoogleAuthProvider();
+                    await auth.signInWithPopup(provider);
+                } catch (e) {
+                    setErr(e.message);
+                } finally {
+                    setBusy(false);
+                }
+            };
+
+            return (
+                <div className="min-h-screen flex items-center justify-center bg-slate-800">
+                    <div className="bg-white p-8 rounded-lg shadow-xl w-96 text-center">
+                        <h1 className="text-2xl font-bold text-slate-800 mb-1">BuildMart POS</h1>
+                        <p className="text-gray-500 mb-6">Hardware & Building Material SaaS</p>
+                        <button
+                            onClick={handleGoogleLogin}
+                            disabled={busy}
+                            className="w-full flex items-center justify-center gap-3 border-2 border-gray-200 hover:bg-gray-50 text-gray-700 p-3 rounded font-bold disabled:opacity-50">
+                            <svg width="20" height="20" viewBox="0 0 48 48"><path fill="#FFC107" d="M43.6 20.5h-1.9V20H24v8h11.3c-1.6 4.7-6.1 8-11.3 8-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.1 8 3l6-6C34.6 5.1 29.6 3 24 3 12.4 3 3 12.4 3 24s9.4 21 21 21 21-9.4 21-21c0-1.4-.1-2.7-.4-3.5z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.6 15.9 18.9 13 24 13c3.1 0 5.8 1.1 8 3l6-6C34.6 5.1 29.6 3 24 3 16.3 3 9.7 7.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 45c5.5 0 10.5-2.1 14.3-5.6l-6.6-5.6C29.6 35.6 27 36.5 24 36.5c-5.2 0-9.6-3.3-11.3-8l-6.6 5.1C9.6 40.6 16.3 45 24 45z"/><path fill="#1976D2" d="M43.6 20.5H24v8h11.3c-.8 2.3-2.2 4.2-4.1 5.6l6.6 5.6C41.4 36.6 45 30.9 45 24c0-1.4-.1-2.7-.4-3.5z"/></svg>
+                            {busy ? 'Signing in...' : 'Continue with Google'}
+                        </button>
+                        {err && <p className="text-red-500 text-sm mt-3">{err}</p>}
+                        <p className="text-xs text-gray-400 mt-6">Naye users ko admin approval chahiye hoga.</p>
+                    </div>
+                </div>
+            );
+        };
+
+        // ============================================================
+        // 2. ONBOARDING (first-time user: create new business OR join existing)
+        // ============================================================
+        const Onboarding = ({ user }) => {
+            const [mode, setMode] = useState(null); // 'create' | 'join'
+            const [orgName, setOrgName] = useState('');
+            const [code, setCode] = useState('');
+            const [busy, setBusy] = useState(false);
+            const [err, setErr] = useState('');
+
+            const createOrg = async (e) => {
+                e.preventDefault();
+                if (!orgName.trim()) return;
+                setBusy(true); setErr('');
+                try {
+                    const orgRef = db.collection('orgs').doc();
+                    await orgRef.set({
+                        name: orgName.trim(),
+                        address: '',
+                        mobile: '',
+                        gstin: '',
+                        ownerId: user.uid,
+                        inviteCode: genInviteCode(),
+                        createdAt: FieldValue.serverTimestamp()
+                    });
+                    await db.collection('users').doc(user.uid).set({
+                        uid: user.uid,
+                        name: user.displayName || 'Owner',
+                        email: user.email,
+                        photoURL: user.photoURL || '',
+                        orgId: orgRef.id,
+                        role: 'owner',
+                        status: 'active',
+                        createdAt: FieldValue.serverTimestamp()
+                    });
+                } catch (e2) {
+                    setErr(e2.message);
+                    setBusy(false);
+                }
+            };
+
+            const joinOrg = async (e) => {
+                e.preventDefault();
+                if (!code.trim()) return;
+                setBusy(true); setErr('');
+                try {
+                    const snap = await db.collection('orgs').where('inviteCode', '==', code.trim().toUpperCase()).limit(1).get();
+                    if (snap.empty) {
+                        setErr('Invalid invite code. Apne admin se sahi code lein.');
+                        setBusy(false);
+                        return;
+                    }
+                    const orgDoc = snap.docs[0];
+                    await db.collection('users').doc(user.uid).set({
+                        uid: user.uid,
+                        name: user.displayName || 'Staff',
+                        email: user.email,
+                        photoURL: user.photoURL || '',
+                        orgId: orgDoc.id,
+                        role: 'staff',
+                        status: 'pending',
+                        createdAt: FieldValue.serverTimestamp()
+                    });
+                } catch (e2) {
+                    setErr(e2.message);
+                    setBusy(false);
+                }
+            };
+
+            return (
+                <div className="min-h-screen flex items-center justify-center bg-slate-800 p-4">
+                    <div className="bg-white p-8 rounded-lg shadow-xl w-full max-w-md">
+                        <h2 className="text-xl font-bold text-center mb-1">Namaste, {user.displayName}!</h2>
+                        <p className="text-center text-gray-500 mb-6 text-sm">Shuru karne ke liye ek option chunein</p>
+
+                        {!mode && (
+                            <div className="space-y-3">
+                                <button onClick={() => setMode('create')} className="w-full bg-orange-600 hover:bg-orange-700 text-white p-3 rounded font-bold">
+                                    🏪 Naya Business Shuru Karein
+                                </button>
+                                <button onClick={() => setMode('join')} className="w-full bg-slate-700 hover:bg-slate-800 text-white p-3 rounded font-bold">
+                                    🔗 Existing Business Join Karein
+                                </button>
+                            </div>
+                        )}
+
+                        {mode === 'create' && (
+                            <form onSubmit={createOrg} className="space-y-4">
+                                <label className="block text-sm font-medium">Business / Shop Ka Naam</label>
+                                <input autoFocus className="w-full border p-2 rounded" placeholder="e.g. Mirza Traders" value={orgName} onChange={e => setOrgName(e.target.value)} required />
+                                {err && <p className="text-red-500 text-sm">{err}</p>}
+                                <div className="flex gap-2">
+                                    <button type="button" onClick={() => setMode(null)} className="bg-gray-200 p-2 rounded flex-1">Back</button>
+                                    <button disabled={busy} className="bg-green-600 text-white p-2 rounded flex-1 font-bold disabled:opacity-50">{busy ? 'Creating...' : 'Create'}</button>
+                                </div>
+                            </form>
+                        )}
+
+                        {mode === 'join' && (
+                            <form onSubmit={joinOrg} className="space-y-4">
+                                <label className="block text-sm font-medium">Invite Code (admin se lein)</label>
+                                <input autoFocus className="w-full border p-2 rounded uppercase tracking-widest text-center font-bold" placeholder="ABC123" value={code} onChange={e => setCode(e.target.value)} required />
+                                {err && <p className="text-red-500 text-sm">{err}</p>}
+                                <div className="flex gap-2">
+                                    <button type="button" onClick={() => setMode(null)} className="bg-gray-200 p-2 rounded flex-1">Back</button>
+                                    <button disabled={busy} className="bg-blue-600 text-white p-2 rounded flex-1 font-bold disabled:opacity-50">{busy ? 'Sending...' : 'Request to Join'}</button>
+                                </div>
+                            </form>
+                        )}
+                    </div>
+                </div>
+            );
+        };
+
+        // ============================================================
+        // 3. PENDING APPROVAL SCREEN
+        // ============================================================
+        const PendingApproval = ({ orgName }) => (
+            <div className="min-h-screen flex items-center justify-center bg-slate-800">
+                <div className="bg-white p-8 rounded-lg shadow-xl w-96 text-center">
+                    <div className="text-5xl mb-4">⏳</div>
+                    <h2 className="text-xl font-bold mb-2">Approval Pending</h2>
+                    <p className="text-gray-500 mb-6">Aapka request <strong>{orgName || 'business'}</strong> ke admin ko bhej diya gaya hai. Approve hote hi aap login kar sakenge.</p>
+                    <button onClick={() => auth.signOut()} className="bg-red-600 text-white px-4 py-2 rounded font-bold">Logout</button>
+                </div>
+            </div>
+        );
+
+        // ============================================================
+        // 4. DASHBOARD
+        // ============================================================
+        const Dashboard = ({ sales, products, lang }) => {
+            const stats = useMemo(() => {
+                const totalSales = sales.reduce((sum, s) => sum + (s.grandTotal || 0), 0);
+                const totalProfit = sales.reduce((sum, s) => sum + (s.totalProfit || 0), 0);
+                const lowStockItems = products.filter(p => p.stock < 10).sort((a, b) => a.stock - b.stock);
+                const prodMap = {};
+                sales.forEach(s => (s.cart || []).forEach(c => { prodMap[c.name] = (prodMap[c.name] || 0) + c.qty; }));
+                const hero = Object.entries(prodMap).sort((a, b) => b[1] - a[1])[0];
+
+                // Category-wise breakdown: stock value, low stock count, units sold, revenue, hero product
+                const catMap = {};
+                const ensure = (cat) => { if (!catMap[cat]) catMap[cat] = { items: 0, stockValue: 0, lowStock: 0, unitsSold: 0, revenue: 0, heroMap: {} }; return catMap[cat]; };
+                products.forEach(p => {
+                    const c = ensure(p.category || 'Other');
+                    c.items++;
+                    c.stockValue += (p.priceBuy || 0) * p.stock;
+                    if (p.stock < 10) c.lowStock++;
+                });
+                sales.forEach(s => (s.cart || []).forEach(item => {
+                    const c = ensure(item.category || 'Other');
+                    c.unitsSold += item.qty;
+                    c.revenue += item.total;
+                    c.heroMap[item.name] = (c.heroMap[item.name] || 0) + item.qty;
+                }));
+                const categoryStats = Object.entries(catMap).map(([cat, d]) => {
+                    const heroSorted = Object.entries(d.heroMap).sort((a, b) => b[1] - a[1]);
+                    return { category: cat, items: d.items, stockValue: d.stockValue, lowStock: d.lowStock, unitsSold: d.unitsSold, revenue: d.revenue, hero: heroSorted[0] ? heroSorted[0][0] : '—' };
+                }).sort((a, b) => b.revenue - a.revenue);
+
+                return { totalSales, totalProfit, lowStockItems, hero: hero ? hero[0] : 'None', categoryStats };
+            }, [sales, products]);
+
+            return (
+                <div className="p-6 overflow-auto">
+                    <h2 className="text-2xl font-bold mb-6">Business Overview</h2>
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
+                        <div className="bg-white p-4 rounded shadow border-l-4 border-blue-500">
+                            <p className="text-gray-500">Total Revenue</p>
+                            <h3 className="text-2xl font-bold">₹{stats.totalSales.toLocaleString()}</h3>
+                        </div>
+                        <div className="bg-white p-4 rounded shadow border-l-4 border-green-500">
+                            <p className="text-gray-500">Net Profit</p>
+                            <h3 className="text-2xl font-bold text-green-600">₹{stats.totalProfit.toLocaleString()}</h3>
+                        </div>
+                        <div className="bg-white p-4 rounded shadow border-l-4 border-red-500">
+                            <p className="text-gray-500">Low Stock Items</p>
+                            <h3 className="text-2xl font-bold text-red-600">{stats.lowStockItems.length}</h3>
+                        </div>
+                        <div className="bg-white p-4 rounded shadow border-l-4 border-yellow-500">
+                            <p className="text-gray-500">Top Selling (Hero)</p>
+                            <h3 className="text-lg font-bold truncate">{stats.hero}</h3>
+                        </div>
+                    </div>
+
+                    <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+                        <div className="bg-white rounded shadow overflow-hidden">
+                            <div className="p-3 bg-gray-50 border-b font-bold">Category Performance</div>
+                            <table className="w-full text-sm">
+                                <thead className="text-left text-gray-500 border-b">
+                                    <tr><th className="p-2">Category</th><th className="p-2">Stock Value</th><th className="p-2">Low</th><th className="p-2">Sold</th><th className="p-2">Revenue</th><th className="p-2">Hero</th></tr>
+                                </thead>
+                                <tbody>
+                                    {stats.categoryStats.map(c => (
+                                        <tr key={c.category} className="border-b hover:bg-gray-50">
+                                            <td className="p-2 font-bold">{catLabel(lang, c.category)}</td>
+                                            <td className="p-2">₹{c.stockValue.toLocaleString()}</td>
+                                            <td className={`p-2 font-bold ${c.lowStock > 0 ? 'text-red-600' : 'text-gray-400'}`}>{c.lowStock}</td>
+                                            <td className="p-2">{c.unitsSold}</td>
+                                            <td className="p-2 font-bold">₹{c.revenue.toLocaleString()}</td>
+                                            <td className="p-2 text-xs truncate max-w-[120px]" title={c.hero}>{c.hero}</td>
+                                        </tr>
+                                    ))}
+                                    {stats.categoryStats.length === 0 && <tr><td colSpan="6" className="p-4 text-center text-gray-400">Koi data nahi hai abhi.</td></tr>}
+                                </tbody>
+                            </table>
+                        </div>
+
+                        <div className="bg-white rounded shadow overflow-hidden">
+                            <div className="p-3 bg-gray-50 border-b font-bold text-red-600">⚠ Low Stock Alert (&lt; 10)</div>
+                            <div className="max-h-80 overflow-auto">
+                                {stats.lowStockItems.map(p => (
+                                    <div key={p.id} className="flex justify-between items-center p-2 border-b text-sm">
+                                        <div>
+                                            <div className="font-bold">{p.name}</div>
+                                            <div className="text-xs text-gray-500">{catLabel(lang, p.category)}{p.brand ? ' · ' + p.brand : ''}</div>
+                                        </div>
+                                        <div className="text-red-600 font-bold">{p.stock} {unitLabel(lang, p.unit)}</div>
+                                    </div>
+                                ))}
+                                {stats.lowStockItems.length === 0 && <div className="p-4 text-center text-gray-400 text-sm">Sab stock theek hai 👍</div>}
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        };
+
+        // ============================================================
+        // 5. INVENTORY (Firestore-backed)
+        // ============================================================
+        const Inventory = ({ orgId, products, isAdmin, lang }) => {
+            const [form, setForm] = useState({ name: '', category: 'Hardware', unit: 'Pcs', priceBuy: '', priceSell: '', stock: '', gst: 18, discount: 0, brand: '', spec: '' });
+            const [search, setSearch] = useState('');
+            const [suggestions, setSuggestions] = useState([]);
+            const [restockProd, setRestockProd] = useState(null); // set when an existing product is picked
+            const [supplier, setSupplier] = useState({ name: '', mobile: '' });
+            const [purchaseMode, setPurchaseMode] = useState('Cash'); // Cash | Udhar (admin only, tracks supplier khata)
+            const [quickBase, setQuickBase] = useState(''); // base item picked from catalog, e.g. "TMT Steel Bar"
+            const nameRef = useRef();
+
+            const productsRef = db.collection('orgs').doc(orgId).collection('products');
+            const catalogEntry = CATALOG[form.category];
+
+            const resetForm = () => {
+                setForm({ name: '', category: 'Hardware', unit: 'Pcs', priceBuy: '', priceSell: '', stock: '', gst: 18, discount: 0, brand: '', spec: '' });
+                setRestockProd(null);
+                setSuggestions([]);
+                setSupplier({ name: '', mobile: '' });
+                setPurchaseMode('Cash');
+                setQuickBase('');
+            };
+
+            // Recompute the final product name whenever spec/brand/base item change
+            const composeName = (base, spec, brand) => [spec, base, brand ? `- ${brand}` : ''].filter(Boolean).join(' ').trim();
+
+            const handleCategoryChange = (cat) => {
+                const entry = CATALOG[cat];
+                setForm({ ...form, category: cat, unit: (entry && !restockProd) ? entry.unit : form.unit, gst: (entry && !restockProd) ? entry.gst : form.gst });
+                setQuickBase('');
+            };
+
+            const pickQuickItem = (item) => {
+                setQuickBase(item);
+                setForm({ ...form, name: item });
+            };
+
+            const updateSpecOrBrand = (field, val) => {
+                const cleanVal = val === '__other__' ? '' : val;
+                const next = { ...form, [field]: cleanVal };
+                if (quickBase) next.name = composeName(quickBase, next.spec, next.brand);
+                setForm(next);
+            };
+
+            const handleNameChange = (val) => {
+                setForm({ ...form, name: val });
+                setQuickBase(''); // manual typing overrides quick-pick composition
+                if (restockProd && val !== restockProd.name) setRestockProd(null); // typing again = fresh search
+                if (val.trim().length > 1) {
+                    setSuggestions(products.filter(p => p.name.toLowerCase().includes(val.toLowerCase())).slice(0, 6));
+                } else {
+                    setSuggestions([]);
+                }
+            };
+
+            const pickSuggestion = (p) => {
+                setForm({
+                    name: p.name, category: p.category, unit: p.unit,
+                    priceBuy: p.priceBuy, priceSell: p.priceSell,
+                    stock: '', gst: p.gst, discount: p.discount,
+                    brand: p.brand || '', spec: p.spec || ''
+                });
+                setRestockProd(p);
+                setSuggestions([]);
+                setQuickBase('');
+            };
+
+            const handleAdd = async (e) => {
+                e.preventDefault();
+                if (!form.name || !form.priceSell) return;
+
+                const stockQty = Number(form.stock) || 0;
+                const buyRate = Number(form.priceBuy) || 0;
+                const isSupplierUdhar = isAdmin && purchaseMode === 'Udhar' && supplier.name.trim() && stockQty > 0;
+
+                let supplierPartyRef = null;
+                if (isSupplierUdhar) {
+                    const partiesRef = db.collection('orgs').doc(orgId).collection('parties');
+                    let existing = null;
+                    if (supplier.mobile) {
+                        const snap = await partiesRef.where('type', '==', 'supplier').where('mobile', '==', supplier.mobile).limit(1).get();
+                        if (!snap.empty) existing = snap.docs[0];
+                    }
+                    supplierPartyRef = existing ? existing.ref : partiesRef.doc();
+                }
+
+                const batch = db.batch();
+                const productRef = restockProd ? productsRef.doc(restockProd.id) : productsRef.doc();
+
+                if (restockProd) {
+                    batch.update(productRef, {
+                        category: form.category, unit: form.unit, brand: form.brand || '', spec: form.spec || '',
+                        priceBuy: buyRate, priceSell: Number(form.priceSell),
+                        gst: Number(form.gst) || 0, discount: Number(form.discount) || 0,
+                        stock: FieldValue.increment(stockQty)
+                    });
+                } else {
+                    batch.set(productRef, {
+                        name: form.name, category: form.category, unit: form.unit, brand: form.brand || '', spec: form.spec || '',
+                        priceBuy: buyRate, priceSell: Number(form.priceSell),
+                        stock: stockQty, gst: Number(form.gst) || 0, discount: Number(form.discount) || 0,
+                        createdAt: FieldValue.serverTimestamp()
+                    });
+                }
+
+                if (isSupplierUdhar) {
+                    const cost = buyRate * stockQty;
+                    batch.set(supplierPartyRef, {
+                        name: supplier.name, mobile: supplier.mobile || '', type: 'supplier',
+                        balance: FieldValue.increment(cost),
+                        createdAt: FieldValue.serverTimestamp()
+                    }, { merge: true });
+                    const txnRef = supplierPartyRef.collection('transactions').doc();
+                    batch.set(txnRef, {
+                        type: 'purchase_credit', amount: cost,
+                        note: `${form.name} x ${stockQty} ${form.unit}`,
+                        date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp()
+                    });
+                }
+
+                await batch.commit();
+                resetForm();
+                nameRef.current.focus();
+            };
+
+            const handleDelete = async (id) => {
+                if (!isAdmin) return alert('Access Denied');
+                if (confirm('Delete product?')) await productsRef.doc(id).delete();
+            };
+
+            const filtered = products.filter(p => p.name.toLowerCase().includes(search.toLowerCase()) || p.category.toLowerCase().includes(search.toLowerCase()) || (p.brand || '').toLowerCase().includes(search.toLowerCase()));
+
+            return (
+                <div className="p-4 h-full overflow-auto">
+                    <div className="bg-white p-4 rounded shadow mb-6">
+                        <div className="flex justify-between items-center mb-2">
+                            <h3 className="font-bold">{restockProd ? `${t(lang, 'inv_restocking')}: ${restockProd.name}` : t(lang, 'inv_addNew')}</h3>
+                            {restockProd && <button type="button" onClick={resetForm} className="text-xs bg-gray-200 px-2 py-1 rounded">{t(lang, 'inv_newProduct')}</button>}
+                        </div>
+                        {restockProd && (
+                            <div className="text-xs bg-blue-50 text-blue-700 border border-blue-200 rounded p-2 mb-3">
+                                Ye material pehle se hai (Current Stock: {restockProd.stock} {unitLabel(lang, restockProd.unit)}). Neeche jo quantity daloge wo isme <strong>add</strong> ho jayegi — naya duplicate item nahi banega.
+                            </div>
+                        )}
+
+                        {/* Category selector first, so Quick Pick can react to it */}
+                        <div className="mb-3">
+                            <label className="text-xs font-bold text-gray-500 block mb-1">{t(lang, 'inv_category')}</label>
+                            <div className="flex flex-wrap gap-1">
+                                {CATEGORIES.map(c => (
+                                    <button type="button" key={c} onClick={() => handleCategoryChange(c)}
+                                        className={`px-3 py-1 rounded-full text-sm border ${form.category === c ? 'bg-orange-600 text-white border-orange-600' : 'bg-white text-gray-600'}`}>
+                                        {catLabel(lang, c)}
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+
+                        {!restockProd && catalogEntry && (
+                            <div className="mb-3 bg-orange-50 border border-orange-200 rounded p-3">
+                                <p className="text-xs font-bold text-orange-700 mb-2">{t(lang, 'inv_quickPick')}</p>
+                                <div className="flex flex-wrap gap-1 mb-2">
+                                    {catalogEntry.items.map(it => (
+                                        <button type="button" key={it} onClick={() => pickQuickItem(it)}
+                                            className={`px-2 py-1 rounded text-xs border ${quickBase === it ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-gray-700 hover:bg-blue-50'}`}>
+                                            {it}
+                                        </button>
+                                    ))}
+                                </div>
+                                {quickBase && (
+                                    <div className="grid grid-cols-2 gap-2">
+                                        <select className="border p-2 rounded text-sm" value={form.spec} onChange={e => updateSpecOrBrand('spec', e.target.value)}>
+                                            <option value="">{t(lang, 'inv_spec')}...</option>
+                                            {catalogEntry.specs.map(s => <option key={s} value={s}>{s}</option>)}
+                                            <option value="__other__">{t(lang, 'inv_other')}</option>
+                                        </select>
+                                        <select className="border p-2 rounded text-sm" value={form.brand} onChange={e => updateSpecOrBrand('brand', e.target.value)}>
+                                            <option value="">{t(lang, 'inv_brand')}...</option>
+                                            {catalogEntry.brands.map(b => <option key={b} value={b}>{b}</option>)}
+                                            <option value="__other__">{t(lang, 'inv_other')}</option>
+                                        </select>
+                                    </div>
+                                )}
+                            </div>
+                        )}
+
+                        <form onSubmit={handleAdd} className="grid grid-cols-2 md:grid-cols-4 gap-4">
+                            <div className="relative">
+                                <input ref={nameRef} autoComplete="off" placeholder={t(lang, 'inv_productName')} className="border p-2 rounded w-full" value={form.name} onChange={e => handleNameChange(e.target.value)} required />
+                                {suggestions.length > 0 && (
+                                    <div className="absolute top-full left-0 w-full bg-white border shadow-lg z-20 max-h-48 overflow-auto rounded-b">
+                                        {suggestions.map(p => (
+                                            <div key={p.id} onClick={() => pickSuggestion(p)} className="p-2 hover:bg-blue-50 cursor-pointer text-sm border-b last:border-b-0">
+                                                <div className="font-bold">{p.name}</div>
+                                                <div className="text-xs text-gray-500">{catLabel(lang, p.category)} · Stock: {p.stock} {unitLabel(lang, p.unit)} · ₹{p.priceSell}</div>
+                                            </div>
+                                        ))}
+                                    </div>
+                                )}
+                            </div>
+                            <input placeholder={t(lang, 'inv_brand')} className="border p-2 rounded" value={form.brand} onChange={e => updateSpecOrBrand('brand', e.target.value)} list="brand-list" />
+                            <input placeholder={t(lang, 'inv_spec')} className="border p-2 rounded" value={form.spec} onChange={e => updateSpecOrBrand('spec', e.target.value)} list="spec-list" />
+                            <select className="border p-2 rounded" value={form.unit} onChange={e => setForm({ ...form, unit: e.target.value })}>
+                                {UNITS.map(u => <option key={u} value={u}>{unitLabel(lang, u)}</option>)}
+                            </select>
+                            {isAdmin && <input type="number" placeholder={t(lang, 'inv_purchaseRate')} className="border p-2 rounded" value={form.priceBuy} onChange={e => setForm({ ...form, priceBuy: e.target.value })} />}
+                            <input type="number" placeholder={t(lang, 'inv_sellRate')} className="border p-2 rounded" value={form.priceSell} onChange={e => setForm({ ...form, priceSell: e.target.value })} required />
+                            <input type="number" placeholder={restockProd ? t(lang, 'inv_addStockQty') : t(lang, 'inv_initialStock')} className="border p-2 rounded" value={form.stock} onChange={e => setForm({ ...form, stock: e.target.value })} />
+                            <div className="flex gap-2">
+                                <input type="number" placeholder={t(lang, 'inv_gst')} className="border p-2 rounded w-1/2" value={form.gst} onChange={e => setForm({ ...form, gst: e.target.value })} />
+                                <input type="number" placeholder={t(lang, 'inv_disc')} className="border p-2 rounded w-1/2" value={form.discount} onChange={e => setForm({ ...form, discount: e.target.value })} />
+                            </div>
+                            <button type="submit" className={`p-2 rounded text-white font-bold ${restockProd ? 'bg-blue-600 hover:bg-blue-700' : 'bg-green-600 hover:bg-green-700'}`}>
+                                {restockProd ? t(lang, 'inv_addStockBtn') : t(lang, 'inv_addBtn')}
+                            </button>
+                        </form>
+                        <datalist id="brand-list">{(catalogEntry ? catalogEntry.brands : []).map(b => <option key={b} value={b} />)}</datalist>
+                        <datalist id="spec-list">{(catalogEntry ? catalogEntry.specs : []).map(s => <option key={s} value={s} />)}</datalist>
+
+                        {isAdmin && Number(form.stock) > 0 && (
+                            <div className="mt-3 pt-3 border-t">
+                                <div className="flex items-center gap-3 flex-wrap">
+                                    <span className="text-xs font-bold text-gray-600">{t(lang, 'inv_purchaseVia')}</span>
+                                    <select className={`border p-1 rounded text-sm font-bold ${purchaseMode === 'Udhar' ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}`} value={purchaseMode} onChange={e => setPurchaseMode(e.target.value)}>
+                                        <option value="Cash">{t(lang, 'inv_cash')}</option>
+                                        <option value="Udhar">{t(lang, 'inv_udhar')}</option>
+                                    </select>
+                                    {purchaseMode === 'Udhar' && (
+                                        <>
+                                            <input className="border p-1 rounded text-sm" placeholder={t(lang, 'inv_supplierName')} value={supplier.name} onChange={e => setSupplier({ ...supplier, name: e.target.value })} />
+                                            <input className="border p-1 rounded text-sm" placeholder={t(lang, 'inv_supplierMobile')} value={supplier.mobile} onChange={e => setSupplier({ ...supplier, mobile: e.target.value })} />
+                                        </>
+                                    )}
+                                </div>
+                                {purchaseMode === 'Udhar' && supplier.name.trim() && (
+                                    <p className="text-xs text-red-600 mt-1">₹{((Number(form.priceBuy) || 0) * (Number(form.stock) || 0)).toLocaleString()} <strong>{supplier.name}</strong> ke Khata Book me "payable" ke roop me add hoga.</p>
+                                )}
+                            </div>
+                        )}
+                    </div>
+
+                    <div className="bg-white rounded shadow overflow-hidden">
+                        <div className="p-3 bg-gray-50 border-b flex justify-between">
+                            <h3 className="font-bold">{t(lang, 'inv_list')} ({products.length})</h3>
+                            <input placeholder={t(lang, 'inv_search')} className="border p-1 rounded" value={search} onChange={e => setSearch(e.target.value)} />
+                        </div>
+                        <table className="w-full text-sm text-left">
+                            <thead className="bg-gray-100">
+                                <tr>
+                                    <th className="p-2">{t(lang, 'inv_name')}</th>
+                                    <th className="p-2">{t(lang, 'inv_brand')}</th>
+                                    <th className="p-2">{t(lang, 'inv_spec')}</th>
+                                    <th className="p-2">{t(lang, 'inv_category')}</th>
+                                    <th className="p-2">{t(lang, 'inv_stock')}</th>
+                                    <th className="p-2">{t(lang, 'inv_sellRateCol')}</th>
+                                    <th className="p-2">{t(lang, 'inv_discCol')}</th>
+                                    <th className="p-2">{t(lang, 'inv_action')}</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {filtered.map(p => (
+                                    <tr key={p.id} className="border-b hover:bg-gray-50">
+                                        <td className="p-2 font-bold">{p.name}</td>
+                                        <td className="p-2 text-gray-600">{p.brand || '—'}</td>
+                                        <td className="p-2 text-gray-600">{p.spec || '—'}</td>
+                                        <td className="p-2">{catLabel(lang, p.category)}</td>
+                                        <td className={`p-2 font-bold ${p.stock < 10 ? 'text-red-600' : 'text-green-600'}`}>{p.stock} {unitLabel(lang, p.unit)}</td>
+                                        <td className="p-2">₹{p.priceSell}</td>
+                                        <td className="p-2">{p.discount}%</td>
+                                        <td className="p-2">{isAdmin && <button onClick={() => handleDelete(p.id)} className="text-red-500 hover:text-red-700">{t(lang, 'inv_delete')}</button>}</td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                    </div>
+                </div>
+            );
+        };
+
+        // ============================================================
+        // 6. POS / BILLING
+        // ============================================================
+        const POS = ({ orgId, org, products, userDoc, firebaseUser }) => {
+            const [cart, setCart] = useState([]);
+            const [query, setQuery] = useState('');
+            const [selectedProd, setSelectedProd] = useState(null);
+            const [qtyInput, setQtyInput] = useState('');
+            const [billType, setBillType] = useState('Estimate');
+            const [paymentMode, setPaymentMode] = useState('Cash'); // Cash | Udhar
+            const [customer, setCustomer] = useState({ name: '', mobile: '', gst: '', address: '' });
+            const [saving, setSaving] = useState(false);
+
+            const searchRef = useRef();
+            const qtyRef = useRef();
+
+            useEffect(() => {
+                const handleKey = (e) => {
+                    if (e.key === 'F2') { e.preventDefault(); searchRef.current && searchRef.current.focus(); }
+                    if (e.key === 'F9') { e.preventDefault(); handlePrint(); }
+                };
+                window.addEventListener('keydown', handleKey);
+                return () => window.removeEventListener('keydown', handleKey);
+            }, [cart, customer]);
+
+            const filteredProducts = query ? products.filter(p => p.name.toLowerCase().includes(query.toLowerCase())) : [];
+
+            const addToCart = (e) => {
+                e.preventDefault();
+                if (!qtyInput || Number(qtyInput) <= 0) return;
+                const qty = Number(qtyInput);
+                if (selectedProd.stock < qty) { alert(`Stock kam hai! Available: ${selectedProd.stock}`); return; }
+                const finalPrice = selectedProd.priceSell - (selectedProd.priceSell * (selectedProd.discount / 100));
+                const newItem = { ...selectedProd, qty, finalPrice, total: finalPrice * qty, profit: (finalPrice - selectedProd.priceBuy) * qty };
+                setCart([...cart, newItem]);
+                setSelectedProd(null); setQtyInput(''); setQuery('');
+                searchRef.current.focus();
+            };
+
+            const selectProduct = (prod) => {
+                setSelectedProd(prod);
+                setQtyInput('');
+                setTimeout(() => qtyRef.current && qtyRef.current.focus(), 100);
+            };
+
+            const fetchGST = () => {
+                if (customer.gst.length === 15) {
+                    setCustomer(prev => ({ ...prev, name: prev.name || 'Customer (verify GST manually)' }));
+                }
+            };
+
+            const handlePrint = async () => {
+                if (cart.length === 0) return alert('Cart Empty!');
+                if (paymentMode === 'Udhar' && !customer.name.trim()) { alert('Udhar ke liye Customer Name daalna zaroori hai!'); return; }
+                if (saving) return;
+                setSaving(true);
+                try {
+                    const grandTotal = cart.reduce((sum, item) => sum + item.total, 0);
+                    const totalProfit = cart.reduce((sum, item) => sum + (item.profit || 0), 0);
+                    const saleData = {
+                        date: new Date().toISOString(),
+                        createdAt: FieldValue.serverTimestamp(),
+                        customer, cart, grandTotal, totalProfit, billType, paymentMode,
+                        staffUid: firebaseUser.uid,
+                        staffName: userDoc.name,
+                        staffEmail: userDoc.email
+                    };
+
+                    // If Udhar (credit) sale, find-or-create the customer's khata party
+                    let partyRef = null;
+                    if (paymentMode === 'Udhar') {
+                        const partiesRef = db.collection('orgs').doc(orgId).collection('parties');
+                        let existing = null;
+                        if (customer.mobile) {
+                            const snap = await partiesRef.where('type', '==', 'customer').where('mobile', '==', customer.mobile).limit(1).get();
+                            if (!snap.empty) existing = snap.docs[0];
+                        }
+                        partyRef = existing ? existing.ref : partiesRef.doc();
+                    }
+
+                    const batch = db.batch();
+                    cart.forEach(item => {
+                        const ref = db.collection('orgs').doc(orgId).collection('products').doc(item.id);
+                        batch.update(ref, { stock: FieldValue.increment(-item.qty) });
+                    });
+                    const saleRef = db.collection('orgs').doc(orgId).collection('sales').doc();
+                    batch.set(saleRef, { ...saleData, partyId: partyRef ? partyRef.id : null });
+
+                    if (partyRef) {
+                        batch.set(partyRef, {
+                            name: customer.name, mobile: customer.mobile || '', type: 'customer',
+                            balance: FieldValue.increment(grandTotal),
+                            createdAt: FieldValue.serverTimestamp()
+                        }, { merge: true });
+                        const txnRef = partyRef.collection('transactions').doc();
+                        batch.set(txnRef, {
+                            type: 'sale_credit', amount: grandTotal, note: `Bill #${saleRef.id.slice(-6)}`,
+                            billId: saleRef.id, date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp(),
+                            staffUid: firebaseUser.uid, staffName: userDoc.name
+                        });
+                    }
+
+                    await batch.commit();
+
+                    document.getElementById('print-content').innerHTML = generateReceiptHTML({ ...saleData, id: saleRef.id }, org);
+                    window.print();
+
+                    setCart([]); setCustomer({ name: '', mobile: '', gst: '', address: '' }); setQuery(''); setPaymentMode('Cash');
+                } catch (e) {
+                    alert('Error: ' + e.message);
+                } finally {
+                    setSaving(false);
+                }
+            };
+
+            const totals = useMemo(() => cart.reduce((s, i) => s + i.total, 0), [cart]);
+
+            return (
+                <div className="flex h-full gap-4 p-4">
+                    <div className="w-2/3 bg-white rounded shadow p-4 flex flex-col">
+                        <div className="flex gap-2 mb-4">
+                            <input ref={searchRef} className="flex-1 border-2 border-blue-500 rounded p-3 text-lg" placeholder="F2: Search Product (Cement, Pipe...)" value={query} onChange={e => setQuery(e.target.value)} />
+                        </div>
+                        <div className="flex-1 overflow-auto grid grid-cols-2 md:grid-cols-3 gap-3 content-start">
+                            {filteredProducts.length > 0 ? filteredProducts.map(p => (
+                                <div key={p.id} onClick={() => selectProduct(p)} className={`cursor-pointer border p-3 rounded hover:bg-blue-50 transition flex justify-between items-center ${p.stock < 5 ? 'bg-red-50' : ''}`}>
+                                    <div><div className="font-bold">{p.name}</div><div className="text-xs text-gray-500">{p.category} | {p.stock} {p.unit}</div></div>
+                                    <div className="text-blue-600 font-bold">₹{p.priceSell}</div>
+                                </div>
+                            )) : <div className="col-span-3 text-center text-gray-400 mt-10">Type to search...</div>}
+                        </div>
+                    </div>
+
+                    <div className="w-1/3 bg-gray-50 rounded shadow flex flex-col border-l">
+                        <div className="p-3 bg-slate-800 text-white rounded-t flex justify-between items-center">
+                            <h2 className="font-bold">Billing Details</h2>
+                            {paymentMode === 'Udhar' && <span className="text-xs bg-red-500 px-2 py-1 rounded font-bold">UDHAR</span>}
+                        </div>
+                        <div className="p-3 space-y-2 bg-white">
+                            <div className="flex gap-2">
+                                <select className="border p-1 rounded text-sm font-bold bg-yellow-100" value={billType} onChange={e => setBillType(e.target.value)}>
+                                    <option>Estimate</option><option>Tax Invoice</option>
+                                </select>
+                                <select className={`border p-1 rounded text-sm font-bold ${paymentMode === 'Udhar' ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}`} value={paymentMode} onChange={e => setPaymentMode(e.target.value)}>
+                                    <option value="Cash">Cash</option>
+                                    <option value="Udhar">Udhar (Credit)</option>
+                                </select>
+                            </div>
+                            <input className="border p-1 rounded w-full text-sm" placeholder={paymentMode === 'Udhar' ? 'Customer Name (zaroori)' : 'Customer Name'} value={customer.name} onChange={e => setCustomer({ ...customer, name: e.target.value })} />
+                            {(paymentMode === 'Udhar' || billType === 'Tax Invoice') && (
+                                <div className="flex gap-1">
+                                    {billType === 'Tax Invoice' && <input className="border p-1 rounded text-sm w-2/3" placeholder="GSTIN" value={customer.gst} onChange={e => setCustomer({ ...customer, gst: e.target.value })} onBlur={fetchGST} />}
+                                    <input className={`border p-1 rounded text-sm ${billType === 'Tax Invoice' ? 'w-1/3' : 'w-full'}`} placeholder="Mobile" value={customer.mobile} onChange={e => setCustomer({ ...customer, mobile: e.target.value })} />
+                                </div>
+                            )}
+                        </div>
+                        <div className="flex-1 overflow-auto p-2">
+                            <table className="w-full text-sm">
+                                <thead className="text-gray-500 border-b"><tr><th className="text-left">Item</th><th className="w-12">Qty</th><th className="text-right">Total</th><th className="w-6"></th></tr></thead>
+                                <tbody>
+                                    {cart.map((item, idx) => (
+                                        <tr key={idx} className="border-b">
+                                            <td className="py-2"><div className="font-bold">{item.name}</div><div className="text-xs text-gray-500">₹{item.finalPrice}</div></td>
+                                            <td>{item.qty}</td>
+                                            <td className="text-right font-bold">₹{item.total}</td>
+                                            <td className="text-red-500 cursor-pointer" onClick={() => setCart(cart.filter((_, i) => i !== idx))}>x</td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                        </div>
+                        <div className="p-4 bg-white border-t">
+                            <div className="flex justify-between items-center mb-4">
+                                <span className="text-gray-500">Total Items: {cart.length}</span>
+                                <span className="text-3xl font-bold text-slate-800">₹{totals}</span>
+                            </div>
+                            <button onClick={handlePrint} disabled={saving} className={`w-full text-white py-3 rounded font-bold text-lg shadow disabled:opacity-50 ${paymentMode === 'Udhar' ? 'bg-red-600 hover:bg-red-700' : 'bg-green-600 hover:bg-green-700'}`}>
+                                {saving ? 'Saving...' : (paymentMode === 'Udhar' ? 'Save as Udhar (F9)' : 'Print & Save (F9)')}
+                            </button>
+                        </div>
+                    </div>
+
+                    {selectedProd && (
+                        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+                            <form onSubmit={addToCart} className="bg-white p-6 rounded shadow-xl w-80">
+                                <h3 className="font-bold text-lg mb-2">{selectedProd.name}</h3>
+                                <div className="flex justify-between text-sm text-gray-600 mb-4"><span>Stock: {selectedProd.stock}</span><span>Rate: ₹{selectedProd.priceSell}</span></div>
+                                <label className="block text-sm font-bold mb-1">Enter Quantity ({selectedProd.unit})</label>
+                                <input ref={qtyRef} type="number" step="0.01" className="w-full border-2 border-blue-500 rounded p-2 text-2xl font-bold text-center mb-4" value={qtyInput} onChange={e => setQtyInput(e.target.value)} />
+                                <div className="grid grid-cols-2 gap-2">
+                                    <button type="button" onClick={() => setSelectedProd(null)} className="bg-gray-200 p-2 rounded">Cancel</button>
+                                    <button type="submit" className="bg-blue-600 text-white p-2 rounded font-bold">Add (Enter)</button>
+                                </div>
+                            </form>
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        // ============================================================
+        // 7. SALES REPORTS
+        // ============================================================
+        const SalesReport = ({ sales, userDoc }) => {
+            const [filter, setFilter] = useState({ from: '', to: '' });
+            const [searchTerm, setSearchTerm] = useState('');
+            const isAdmin = userDoc.role === 'owner' || userDoc.role === 'admin';
+
+            const filteredSales = sales.filter(s => {
+                const sDate = (s.date || '').split('T')[0];
+                const dateMatch = (!filter.from || sDate >= filter.from) && (!filter.to || sDate <= filter.to);
+                const userMatch = isAdmin ? true : s.staffUid === userDoc.uid;
+                const searchMatch = (s.customer.name || '').toLowerCase().includes(searchTerm.toLowerCase()) || s.id.toString().includes(searchTerm);
+                return dateMatch && userMatch && searchMatch;
+            }).slice().reverse();
+
+            const downloadExcel = () => {
+                let csv = 'ID,Date,Customer,Staff,Bill Type,Amount\n';
+                filteredSales.forEach(s => { csv += `${s.id},${new Date(s.date).toLocaleDateString()},${s.customer.name},${s.staffName},${s.billType},${s.grandTotal}\n`; });
+                const blob = new Blob([csv], { type: 'text/csv' });
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url; a.download = `Sales_Report_${new Date().toISOString().slice(0, 10)}.csv`; a.click();
+            };
+
+            return (
+                <div className="p-6 overflow-auto">
+                    <div className="flex flex-wrap gap-4 mb-6 bg-white p-4 rounded shadow items-end">
+                        <div><label className="text-xs font-bold block">From Date</label><input type="date" className="border p-2 rounded" value={filter.from} onChange={e => setFilter({ ...filter, from: e.target.value })} /></div>
+                        <div><label className="text-xs font-bold block">To Date</label><input type="date" className="border p-2 rounded" value={filter.to} onChange={e => setFilter({ ...filter, to: e.target.value })} /></div>
+                        <div className="flex-1"><label className="text-xs font-bold block">Search ID/Customer</label><input className="border p-2 rounded w-full" value={searchTerm} onChange={e => setSearchTerm(e.target.value)} placeholder="Name or Bill ID" /></div>
+                        <button onClick={downloadExcel} className="bg-green-600 text-white p-2 rounded font-bold">Export Excel</button>
+                    </div>
+                    <div className="bg-white rounded shadow overflow-hidden">
+                        <table className="w-full text-sm">
+                            <thead className="bg-gray-100 border-b"><tr><th className="p-3 text-left">Bill ID</th><th className="p-3 text-left">Date</th><th className="p-3 text-left">Customer</th><th className="p-3 text-left">Type</th><th className="p-3 text-left">Staff</th><th className="p-3 text-right">Amount</th></tr></thead>
+                            <tbody>
+                                {filteredSales.map(s => (
+                                    <tr key={s.id} className="border-b hover:bg-gray-50">
+                                        <td className="p-3 font-mono text-xs">{s.id.toString().slice(-8)}</td>
+                                        <td className="p-3">{new Date(s.date).toLocaleString()}</td>
+                                        <td className="p-3 font-bold">{s.customer.name || 'Walk-in'}</td>
+                                        <td className="p-3"><span className={`px-2 py-1 rounded text-xs ${s.billType === 'Estimate' ? 'bg-yellow-100 text-yellow-800' : 'bg-blue-100 text-blue-800'}`}>{s.billType}</span></td>
+                                        <td className="p-3">{s.staffName}</td>
+                                        <td className="p-3 text-right font-bold">₹{s.grandTotal}</td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                        {filteredSales.length === 0 && <div className="p-4 text-center text-gray-500">No records found.</div>}
+                    </div>
+                </div>
+            );
+        };
+
+        // ============================================================
+        // 8. QUOTATION (A4)
+        // ============================================================
+        const Quotation = ({ products, org }) => {
+            const [qItems, setQItems] = useState([]);
+            const [qCust, setQCust] = useState({ name: '', date: new Date().toISOString().split('T')[0] });
+            const [manualItem, setManualItem] = useState({ name: '', unit: 'Pcs', price: '', qty: '' });
+            const [rec, setRec] = useState([]);
+
+            const handleManualAdd = () => {
+                if (!manualItem.name || !manualItem.price) return;
+                setQItems([...qItems, { ...manualItem, total: manualItem.price * manualItem.qty }]);
+                setManualItem({ name: '', unit: 'Pcs', price: '', qty: '' });
+                setRec([]);
+            };
+
+            const searchForRec = (val) => {
+                setManualItem({ ...manualItem, name: val });
+                if (val.length > 1) setRec(products.filter(p => p.name.toLowerCase().includes(val.toLowerCase())));
+                else setRec([]);
+            };
+
+            const pickRec = (p) => { setManualItem({ name: p.name, unit: p.unit, price: p.priceSell, qty: 1 }); setRec([]); };
+
+            const printQuotation = () => {
+                const total = qItems.reduce((s, i) => s + i.total, 0);
+                const data = { id: 'QT-' + Date.now().toString().slice(-4), date: qCust.date, customer: qCust, cart: qItems, grandTotal: total, billType: 'Quotation' };
+                document.getElementById('print-content').innerHTML = generateReceiptHTML(data, org);
+                window.print();
+            };
+
+            return (
+                <div className="p-6 max-w-4xl mx-auto overflow-auto">
+                    <div className="bg-white rounded shadow p-6">
+                        <div className="flex justify-between items-center mb-6 border-b pb-4">
+                            <h2 className="text-xl font-bold">Create Quotation (A4)</h2>
+                            <button onClick={printQuotation} className="bg-purple-600 text-white px-4 py-2 rounded">Print / Save PDF</button>
+                        </div>
+                        <div className="grid grid-cols-2 gap-4 mb-6">
+                            <input className="border p-2 rounded" placeholder="Customer Name" value={qCust.name} onChange={e => setQCust({ ...qCust, name: e.target.value })} />
+                            <input type="date" className="border p-2 rounded" value={qCust.date} onChange={e => setQCust({ ...qCust, date: e.target.value })} />
+                        </div>
+                        <div className="bg-gray-50 p-4 rounded mb-6 relative">
+                            <h4 className="font-bold mb-2 text-sm text-gray-600">Add Item (Stock or Manual)</h4>
+                            <div className="flex gap-2">
+                                <div className="flex-1 relative">
+                                    <input className="w-full border p-2 rounded" placeholder="Item Name" value={manualItem.name} onChange={e => searchForRec(e.target.value)} />
+                                    {rec.length > 0 && (
+                                        <div className="absolute top-full left-0 w-full bg-white border shadow-lg z-10 max-h-40 overflow-auto">
+                                            {rec.map(r => <div key={r.id} onClick={() => pickRec(r)} className="p-2 hover:bg-gray-100 cursor-pointer text-sm">{r.name} (Stock: {r.stock})</div>)}
+                                        </div>
+                                    )}
+                                </div>
+                                <input className="w-20 border p-2 rounded" placeholder="Qty" type="number" value={manualItem.qty} onChange={e => setManualItem({ ...manualItem, qty: e.target.value })} />
+                                <select className="w-24 border p-2 rounded" value={manualItem.unit} onChange={e => setManualItem({ ...manualItem, unit: e.target.value })}>{UNITS.map(u => <option key={u}>{u}</option>)}</select>
+                                <input className="w-24 border p-2 rounded" placeholder="Rate" type="number" value={manualItem.price} onChange={e => setManualItem({ ...manualItem, price: e.target.value })} />
+                                <button onClick={handleManualAdd} className="bg-blue-600 text-white px-4 rounded">+</button>
+                            </div>
+                        </div>
+                        <table className="w-full text-sm border">
+                            <thead className="bg-gray-200"><tr><th className="p-2 text-left">Description</th><th className="p-2 w-20">Qty</th><th className="p-2 w-20">Unit</th><th className="p-2 text-right">Rate</th><th className="p-2 text-right">Total</th><th className="w-10"></th></tr></thead>
+                            <tbody>
+                                {qItems.map((item, i) => (
+                                    <tr key={i} className="border-b">
+                                        <td className="p-2">{item.name}</td><td className="p-2">{item.qty}</td><td className="p-2">{item.unit}</td>
+                                        <td className="p-2 text-right">{item.price}</td><td className="p-2 text-right">{item.total}</td>
+                                        <td className="p-2 text-red-500 cursor-pointer" onClick={() => setQItems(qItems.filter((_, idx) => idx !== i))}>x</td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                            <tfoot><tr><td colSpan="4" className="p-2 text-right font-bold">Total:</td><td className="p-2 text-right font-bold">₹{qItems.reduce((s, i) => s + i.total, 0)}</td><td></td></tr></tfoot>
+                        </table>
+                    </div>
+                </div>
+            );
+        };
+
+        // ============================================================
+        // 9. USER MANAGEMENT (Admin: approve/reject staff, invite code)
+        // ============================================================
+        const PERMISSION_LABELS = {
+            pos: 'Sell (POS/Billing)',
+            inventory: 'Add / Restock Inventory',
+            reports: 'View Sales Reports',
+            profit: 'View Profit & Loss',
+            khata: 'Manage Udhar Khata',
+            dashboard: 'View Dashboard'
+        };
+
+        const UserMgmt = ({ orgId, org }) => {
+            const [users, setUsers] = useState([]);
+            const [copied, setCopied] = useState(false);
+            const [expandedId, setExpandedId] = useState(null);
+
+            useEffect(() => {
+                const unsub = db.collection('users').where('orgId', '==', orgId).onSnapshot(snap => {
+                    setUsers(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+                });
+                return unsub;
+            }, [orgId]);
+
+            const pending = users.filter(u => u.status === 'pending');
+            const active = users.filter(u => u.status === 'active');
+
+            const approve = async (u, role) => {
+                const update = { status: 'active', role: role || 'staff' };
+                if (role === 'staff') update.permissions = defaultPermissions();
+                await db.collection('users').doc(u.id).update(update);
+            };
+            const reject = async (u) => {
+                if (confirm(`Reject ${u.name}'s request?`)) await db.collection('users').doc(u.id).delete();
+            };
+            const changeRole = async (u, role) => {
+                if (u.role === 'owner') return alert('Owner role cannot be changed here.');
+                const update = { role };
+                if (role === 'staff' && !u.permissions) update.permissions = defaultPermissions();
+                await db.collection('users').doc(u.id).update(update);
+            };
+            const togglePermission = async (u, key) => {
+                const perms = { ...(u.permissions || defaultPermissions()) };
+                perms[key] = !perms[key];
+                await db.collection('users').doc(u.id).update({ permissions: perms });
+            };
+            const disable = async (u) => {
+                if (u.role === 'owner') return alert('Cannot disable the owner.');
+                if (confirm(`Disable ${u.name}'s access?`)) await db.collection('users').doc(u.id).update({ status: 'disabled' });
+            };
+            const reEnable = async (u) => { await db.collection('users').doc(u.id).update({ status: 'active' }); };
+
+            const regenerateCode = async () => {
+                if (!confirm('Purana invite code kaam nahi karega. Continue?')) return;
+                await db.collection('orgs').doc(orgId).update({ inviteCode: genInviteCode() });
+            };
+            const copyCode = () => {
+                navigator.clipboard.writeText(org.inviteCode);
+                setCopied(true); setTimeout(() => setCopied(false), 1500);
+            };
+
+            return (
+                <div className="p-6 overflow-auto">
+                    <h2 className="text-xl font-bold mb-4">Staff & Admin Management</h2>
+
+                    <div className="bg-white p-4 rounded shadow mb-6 max-w-2xl border-l-4 border-blue-500">
+                        <h3 className="font-bold mb-2">Invite Code</h3>
+                        <p className="text-sm text-gray-500 mb-2">Staff ko ye code dein taaki wo "Join Existing Business" se request bhej sakein.</p>
+                        <div className="flex items-center gap-2">
+                            <span className="text-2xl font-bold tracking-widest bg-gray-100 px-4 py-2 rounded">{org.inviteCode}</span>
+                            <button onClick={copyCode} className="bg-slate-700 text-white px-3 py-2 rounded text-sm">{copied ? 'Copied!' : 'Copy'}</button>
+                            <button onClick={regenerateCode} className="bg-red-100 text-red-700 px-3 py-2 rounded text-sm">Regenerate</button>
+                        </div>
+                    </div>
+
+                    {pending.length > 0 && (
+                        <div className="bg-white p-4 rounded shadow mb-6 max-w-2xl border-l-4 border-yellow-500">
+                            <h3 className="font-bold mb-2">Pending Approvals ({pending.length})</h3>
+                            {pending.map(u => (
+                                <div key={u.id} className="flex justify-between items-center border-b py-3">
+                                    <div><span className="font-bold">{u.name}</span><div className="text-xs text-gray-500">{u.email}</div></div>
+                                    <div className="flex gap-2">
+                                        <button onClick={() => approve(u, 'staff')} className="bg-green-600 text-white px-3 py-1 rounded text-sm">Approve as Staff</button>
+                                        <button onClick={() => approve(u, 'admin')} className="bg-blue-600 text-white px-3 py-1 rounded text-sm">Approve as Admin (Full Access)</button>
+                                        <button onClick={() => reject(u)} className="bg-gray-200 px-3 py-1 rounded text-sm">Reject</button>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+
+                    <div className="bg-white p-4 rounded shadow max-w-2xl">
+                        <h3 className="font-bold mb-2">Team Members ({active.length})</h3>
+                        <p className="text-xs text-gray-500 mb-2">Admin/Owner ko hamesha full access hota hai. Staff ke liye niche "Permissions" se control karein ki wo kya-kya kar sakta hai.</p>
+                        <ul>
+                            {active.map(u => {
+                                const perms = u.permissions || defaultPermissions();
+                                return (
+                                    <li key={u.id} className="border-b py-3">
+                                        <div className="flex justify-between items-center">
+                                            <div>
+                                                <span className="font-bold">{u.name}</span> <span className="text-xs bg-gray-200 px-1 rounded">{u.role}</span>
+                                                <div className="text-xs text-gray-500">{u.email}</div>
+                                            </div>
+                                            {u.role !== 'owner' && (
+                                                <div className="flex gap-2 items-center">
+                                                    <select className="border p-1 rounded text-sm" value={u.role} onChange={e => changeRole(u, e.target.value)}>
+                                                        <option value="staff">Staff</option>
+                                                        <option value="admin">Admin (Full Access)</option>
+                                                    </select>
+                                                    {u.role === 'staff' && (
+                                                        <button onClick={() => setExpandedId(expandedId === u.id ? null : u.id)} className="text-blue-600 text-sm border px-2 py-1 rounded">
+                                                            {expandedId === u.id ? 'Hide' : 'Permissions'}
+                                                        </button>
+                                                    )}
+                                                    <button onClick={() => disable(u)} className="text-red-600 text-sm border px-2 py-1 rounded">Disable</button>
+                                                </div>
+                                            )}
+                                        </div>
+                                        {u.role === 'staff' && expandedId === u.id && (
+                                            <div className="mt-2 ml-1 grid grid-cols-2 gap-1 bg-gray-50 p-3 rounded">
+                                                {Object.keys(PERMISSION_LABELS).map(key => (
+                                                    <label key={key} className="flex items-center gap-2 text-sm cursor-pointer">
+                                                        <input type="checkbox" checked={!!perms[key]} onChange={() => togglePermission(u, key)} />
+                                                        {PERMISSION_LABELS[key]}
+                                                    </label>
+                                                ))}
+                                            </div>
+                                        )}
+                                    </li>
+                                );
+                            })}
+                            {users.filter(u => u.status === 'disabled').map(u => (
+                                <li key={u.id} className="flex justify-between items-center border-b py-3 opacity-60">
+                                    <div><span className="font-bold">{u.name}</span> <span className="text-xs bg-red-100 text-red-700 px-1 rounded">disabled</span></div>
+                                    <button onClick={() => reEnable(u)} className="text-green-600 text-sm border px-2 py-1 rounded">Re-enable</button>
+                                </li>
+                            ))}
+                        </ul>
+                    </div>
+                </div>
+            );
+        };
+
+        // ============================================================
+        // 10. SETTINGS (org profile used on printed bills)
+        // ============================================================
+        const Settings = ({ orgId, org }) => {
+            const [form, setForm] = useState({ name: org.name || '', address: org.address || '', mobile: org.mobile || '', gstin: org.gstin || '' });
+            const [saved, setSaved] = useState(false);
+
+            const save = async (e) => {
+                e.preventDefault();
+                await db.collection('orgs').doc(orgId).update(form);
+                setSaved(true); setTimeout(() => setSaved(false), 1500);
+            };
+
+            return (
+                <div className="p-6 overflow-auto">
+                    <h2 className="text-xl font-bold mb-4">Business Settings</h2>
+                    <form onSubmit={save} className="bg-white p-6 rounded shadow max-w-xl space-y-4">
+                        <div><label className="text-sm font-bold block mb-1">Business Name</label><input className="w-full border p-2 rounded" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })} required /></div>
+                        <div><label className="text-sm font-bold block mb-1">Address</label><input className="w-full border p-2 rounded" value={form.address} onChange={e => setForm({ ...form, address: e.target.value })} /></div>
+                        <div><label className="text-sm font-bold block mb-1">Mobile</label><input className="w-full border p-2 rounded" value={form.mobile} onChange={e => setForm({ ...form, mobile: e.target.value })} /></div>
+                        <div><label className="text-sm font-bold block mb-1">GSTIN (optional)</label><input className="w-full border p-2 rounded" value={form.gstin} onChange={e => setForm({ ...form, gstin: e.target.value })} /></div>
+                        <button className="bg-orange-600 text-white px-4 py-2 rounded font-bold">{saved ? 'Saved ✓' : 'Save'}</button>
+                    </form>
+                </div>
+            );
+        };
+
+        // ============================================================
+        // 11. KHATA BOOK — Udhar diya (customers) / Udhar liya (suppliers)
+        // ============================================================
+        const KhataBook = ({ orgId, userDoc, firebaseUser }) => {
+            const [tab, setTab] = useState('customer'); // customer | supplier
+            const [parties, setParties] = useState([]);
+            const [search, setSearch] = useState('');
+            const [openParty, setOpenParty] = useState(null); // party being viewed/paid
+            const [txns, setTxns] = useState([]);
+            const [payAmount, setPayAmount] = useState('');
+            const [payNote, setPayNote] = useState('');
+            const [showNewParty, setShowNewParty] = useState(false);
+            const [newParty, setNewParty] = useState({ name: '', mobile: '', opening: '' });
+
+            const partiesRef = db.collection('orgs').doc(orgId).collection('parties');
+
+            useEffect(() => {
+                const unsub = partiesRef.where('type', '==', tab).onSnapshot(snap => {
+                    setParties(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+                });
+                return unsub;
+            }, [orgId, tab]);
+
+            useEffect(() => {
+                if (!openParty) { setTxns([]); return; }
+                const unsub = partiesRef.doc(openParty.id).collection('transactions').orderBy('createdAt', 'desc').limit(50).onSnapshot(snap => {
+                    setTxns(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+                });
+                return unsub;
+            }, [openParty]);
+
+            const filtered = parties.filter(p => p.name.toLowerCase().includes(search.toLowerCase()) || (p.mobile || '').includes(search))
+                .sort((a, b) => (b.balance || 0) - (a.balance || 0));
+
+            const totalOutstanding = parties.reduce((s, p) => s + (p.balance || 0), 0);
+
+            const addManualTxn = async (isCredit) => {
+                // isCredit: customer -> "Udhar Diya" (+) / supplier -> "Udhar Liya" (+)
+                // !isCredit: "Payment Mila/Diya" (-)
+                const amt = Number(payAmount);
+                if (!amt || amt <= 0) return alert('Sahi amount daalein');
+                const sign = isCredit ? 1 : -1;
+                const type = tab === 'customer'
+                    ? (isCredit ? 'sale_credit' : 'payment_received')
+                    : (isCredit ? 'purchase_credit' : 'payment_made');
+                await partiesRef.doc(openParty.id).update({ balance: FieldValue.increment(sign * amt) });
+                await partiesRef.doc(openParty.id).collection('transactions').add({
+                    type, amount: amt, note: payNote || '',
+                    date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp(),
+                    staffUid: firebaseUser.uid, staffName: userDoc.name
+                });
+                setPayAmount(''); setPayNote('');
+            };
+
+            const createParty = async (e) => {
+                e.preventDefault();
+                if (!newParty.name.trim()) return;
+                const opening = Number(newParty.opening) || 0;
+                const ref = await partiesRef.add({
+                    name: newParty.name.trim(), mobile: newParty.mobile.trim(), type: tab,
+                    balance: opening, createdAt: FieldValue.serverTimestamp()
+                });
+                if (opening !== 0) {
+                    await ref.collection('transactions').add({
+                        type: 'opening_balance', amount: opening, note: 'Opening balance',
+                        date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp(),
+                        staffUid: firebaseUser.uid, staffName: userDoc.name
+                    });
+                }
+                setNewParty({ name: '', mobile: '', opening: '' });
+                setShowNewParty(false);
+            };
+
+            const txnLabel = { sale_credit: 'Udhar Diya', purchase_credit: 'Udhar Liya', payment_received: 'Payment Mila', payment_made: 'Payment Diya', opening_balance: 'Opening Balance' };
+
+            return (
+                <div className="p-6 overflow-auto">
+                    <h2 className="text-xl font-bold mb-1">Udhar Khata Book</h2>
+                    <p className="text-sm text-gray-500 mb-4">Customers ko diya hua udhar aur suppliers ka udhar — dono yahan track hote hain.</p>
+
+                    <div className="flex gap-2 mb-4">
+                        <button onClick={() => { setTab('customer'); setOpenParty(null); }} className={`px-4 py-2 rounded font-bold ${tab === 'customer' ? 'bg-slate-800 text-white' : 'bg-white border'}`}>
+                            Customers (Aapko Milna Hai)
+                        </button>
+                        <button onClick={() => { setTab('supplier'); setOpenParty(null); }} className={`px-4 py-2 rounded font-bold ${tab === 'supplier' ? 'bg-slate-800 text-white' : 'bg-white border'}`}>
+                            Suppliers (Aapko Dena Hai)
+                        </button>
+                    </div>
+
+                    <div className={`mb-4 p-4 rounded shadow text-white ${tab === 'customer' ? 'bg-green-600' : 'bg-red-600'}`}>
+                        <p className="text-sm opacity-90">{tab === 'customer' ? 'Total To Receive' : 'Total To Pay'}</p>
+                        <h3 className="text-2xl font-bold">₹{totalOutstanding.toLocaleString()}</h3>
+                    </div>
+
+                    <div className="flex gap-2 mb-4">
+                        <input className="border p-2 rounded flex-1" placeholder="Search naam/mobile..." value={search} onChange={e => setSearch(e.target.value)} />
+                        <button onClick={() => setShowNewParty(true)} className="bg-slate-700 text-white px-4 py-2 rounded font-bold">+ Naya {tab === 'customer' ? 'Customer' : 'Supplier'}</button>
+                    </div>
+
+                    <div className="bg-white rounded shadow overflow-hidden">
+                        {filtered.length === 0 && <div className="p-4 text-center text-gray-500">Koi record nahi hai.</div>}
+                        {filtered.map(p => (
+                            <div key={p.id} onClick={() => setOpenParty(p)} className="flex justify-between items-center p-3 border-b hover:bg-gray-50 cursor-pointer">
+                                <div><div className="font-bold">{p.name}</div><div className="text-xs text-gray-500">{p.mobile}</div></div>
+                                <div className={`font-bold ${(p.balance || 0) > 0 ? 'text-red-600' : 'text-green-600'}`}>₹{(p.balance || 0).toLocaleString()}</div>
+                            </div>
+                        ))}
+                    </div>
+
+                    {showNewParty && (
+                        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+                            <form onSubmit={createParty} className="bg-white p-6 rounded shadow-xl w-96">
+                                <h3 className="font-bold text-lg mb-4">Naya {tab === 'customer' ? 'Customer' : 'Supplier'}</h3>
+                                <div className="space-y-3">
+                                    <input autoFocus className="w-full border p-2 rounded" placeholder="Naam" value={newParty.name} onChange={e => setNewParty({ ...newParty, name: e.target.value })} required />
+                                    <input className="w-full border p-2 rounded" placeholder="Mobile" value={newParty.mobile} onChange={e => setNewParty({ ...newParty, mobile: e.target.value })} />
+                                    <input type="number" className="w-full border p-2 rounded" placeholder="Opening Balance (agar pehle se udhar hai)" value={newParty.opening} onChange={e => setNewParty({ ...newParty, opening: e.target.value })} />
+                                </div>
+                                <div className="grid grid-cols-2 gap-2 mt-4">
+                                    <button type="button" onClick={() => setShowNewParty(false)} className="bg-gray-200 p-2 rounded">Cancel</button>
+                                    <button type="submit" className="bg-blue-600 text-white p-2 rounded font-bold">Create</button>
+                                </div>
+                            </form>
+                        </div>
+                    )}
+
+                    {openParty && (
+                        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+                            <div className="bg-white rounded shadow-xl w-full max-w-lg max-h-[90vh] flex flex-col">
+                                <div className="p-4 border-b flex justify-between items-center">
+                                    <div><h3 className="font-bold text-lg">{openParty.name}</h3><p className="text-xs text-gray-500">{openParty.mobile}</p></div>
+                                    <button onClick={() => setOpenParty(null)} className="text-gray-400 text-xl">&times;</button>
+                                </div>
+                                <div className={`p-3 text-center font-bold text-white ${(parties.find(p => p.id === openParty.id) || openParty).balance > 0 ? 'bg-red-600' : 'bg-green-600'}`}>
+                                    Balance: ₹{((parties.find(p => p.id === openParty.id) || openParty).balance || 0).toLocaleString()}
+                                </div>
+
+                                <div className="p-4 border-b bg-gray-50">
+                                    <div className="flex gap-2 mb-2">
+                                        <input type="number" className="border p-2 rounded flex-1" placeholder="Amount ₹" value={payAmount} onChange={e => setPayAmount(e.target.value)} />
+                                        <input className="border p-2 rounded flex-1" placeholder="Note (optional)" value={payNote} onChange={e => setPayNote(e.target.value)} />
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-2">
+                                        <button onClick={() => addManualTxn(true)} className="bg-red-100 text-red-700 p-2 rounded font-bold text-sm">
+                                            {tab === 'customer' ? '+ Udhar Diya' : '+ Udhar Liya'}
+                                        </button>
+                                        <button onClick={() => addManualTxn(false)} className="bg-green-100 text-green-700 p-2 rounded font-bold text-sm">
+                                            {tab === 'customer' ? '− Payment Mila' : '− Payment Diya'}
+                                        </button>
+                                    </div>
+                                </div>
+
+                                <div className="flex-1 overflow-auto p-4">
+                                    <h4 className="font-bold text-sm text-gray-500 mb-2">History</h4>
+                                    {txns.map(t => (
+                                        <div key={t.id} className="flex justify-between items-center border-b py-2 text-sm">
+                                            <div>
+                                                <div className="font-bold">{txnLabel[t.type] || t.type}</div>
+                                                <div className="text-xs text-gray-500">{t.note} · {new Date(t.date).toLocaleDateString()}</div>
+                                            </div>
+                                            <div className={`font-bold ${(t.type === 'sale_credit' || t.type === 'purchase_credit' || (t.type === 'opening_balance' && t.amount > 0)) ? 'text-red-600' : 'text-green-600'}`}>
+                                                ₹{t.amount.toLocaleString()}
+                                            </div>
+                                        </div>
+                                    ))}
+                                    {txns.length === 0 && <p className="text-center text-gray-400 text-sm">Koi transaction nahi hai.</p>}
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        // ============================================================
+        // 12. PROFIT & LOSS
+        // ============================================================
+        const ProfitLoss = ({ orgId, sales }) => {
+            const [filter, setFilter] = useState({ from: '', to: '' });
+            const [expenses, setExpenses] = useState([]);
+            const [expForm, setExpForm] = useState({ category: 'Rent', amount: '', note: '', date: new Date().toISOString().split('T')[0] });
+
+            const expensesRef = db.collection('orgs').doc(orgId).collection('expenses');
+
+            useEffect(() => {
+                const unsub = expensesRef.orderBy('date', 'desc').onSnapshot(snap => setExpenses(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
+                return unsub;
+            }, [orgId]);
+
+            const inRange = (dateStr) => {
+                const d = dateStr.split('T')[0];
+                return (!filter.from || d >= filter.from) && (!filter.to || d <= filter.to);
+            };
+
+            const filteredSales = sales.filter(s => inRange(s.date));
+            const filteredExpenses = expenses.filter(e => inRange(e.date));
+
+            const revenue = filteredSales.reduce((s, x) => s + (x.grandTotal || 0), 0);
+            const cogs = filteredSales.reduce((s, x) => s + (x.cart || []).reduce((cs, item) => cs + (item.priceBuy || 0) * item.qty, 0), 0);
+            const grossProfit = revenue - cogs;
+            const totalExpenses = filteredExpenses.reduce((s, x) => s + (x.amount || 0), 0);
+            const netProfit = grossProfit - totalExpenses;
+            const margin = revenue > 0 ? ((netProfit / revenue) * 100).toFixed(1) : '0.0';
+
+            const addExpense = async (e) => {
+                e.preventDefault();
+                if (!expForm.amount) return;
+                await expensesRef.add({ ...expForm, amount: Number(expForm.amount), createdAt: FieldValue.serverTimestamp() });
+                setExpForm({ ...expForm, amount: '', note: '' });
+            };
+            const deleteExpense = async (id) => {
+                if (confirm('Delete this expense?')) await expensesRef.doc(id).delete();
+            };
+
+            return (
+                <div className="p-6 overflow-auto">
+                    <h2 className="text-xl font-bold mb-4">Profit & Loss</h2>
+
+                    <div className="flex flex-wrap gap-4 mb-6 bg-white p-4 rounded shadow items-end">
+                        <div><label className="text-xs font-bold block">From Date</label><input type="date" className="border p-2 rounded" value={filter.from} onChange={e => setFilter({ ...filter, from: e.target.value })} /></div>
+                        <div><label className="text-xs font-bold block">To Date</label><input type="date" className="border p-2 rounded" value={filter.to} onChange={e => setFilter({ ...filter, to: e.target.value })} /></div>
+                    </div>
+
+                    <div className="grid grid-cols-2 md:grid-cols-5 gap-4 mb-6">
+                        <div className="bg-white p-4 rounded shadow border-l-4 border-blue-500"><p className="text-xs text-gray-500">Revenue</p><h3 className="text-xl font-bold">₹{revenue.toLocaleString()}</h3></div>
+                        <div className="bg-white p-4 rounded shadow border-l-4 border-gray-400"><p className="text-xs text-gray-500">Cost of Goods</p><h3 className="text-xl font-bold">₹{cogs.toLocaleString()}</h3></div>
+                        <div className="bg-white p-4 rounded shadow border-l-4 border-green-500"><p className="text-xs text-gray-500">Gross Profit</p><h3 className="text-xl font-bold text-green-600">₹{grossProfit.toLocaleString()}</h3></div>
+                        <div className="bg-white p-4 rounded shadow border-l-4 border-red-400"><p className="text-xs text-gray-500">Expenses</p><h3 className="text-xl font-bold text-red-600">₹{totalExpenses.toLocaleString()}</h3></div>
+                        <div className={`p-4 rounded shadow border-l-4 ${netProfit >= 0 ? 'border-green-600' : 'border-red-600'}`}>
+                            <p className="text-xs text-gray-500">Net Profit ({margin}%)</p>
+                            <h3 className={`text-xl font-bold ${netProfit >= 0 ? 'text-green-700' : 'text-red-700'}`}>₹{netProfit.toLocaleString()}</h3>
+                        </div>
+                    </div>
+
+                    <div className="bg-white p-4 rounded shadow max-w-3xl">
+                        <h3 className="font-bold mb-3">Business Expenses (Rent, Salary, etc.)</h3>
+                        <form onSubmit={addExpense} className="flex flex-wrap gap-2 mb-4">
+                            <select className="border p-2 rounded" value={expForm.category} onChange={e => setExpForm({ ...expForm, category: e.target.value })}>
+                                {EXPENSE_CATEGORIES.map(c => <option key={c}>{c}</option>)}
+                            </select>
+                            <input type="number" className="border p-2 rounded w-28" placeholder="Amount ₹" value={expForm.amount} onChange={e => setExpForm({ ...expForm, amount: e.target.value })} required />
+                            <input type="date" className="border p-2 rounded" value={expForm.date} onChange={e => setExpForm({ ...expForm, date: e.target.value })} />
+                            <input className="border p-2 rounded flex-1 min-w-[120px]" placeholder="Note (optional)" value={expForm.note} onChange={e => setExpForm({ ...expForm, note: e.target.value })} />
+                            <button className="bg-orange-600 text-white px-4 rounded font-bold">Add</button>
+                        </form>
+                        <table className="w-full text-sm">
+                            <thead className="text-left text-gray-500 border-b"><tr><th className="py-1">Date</th><th>Category</th><th>Note</th><th className="text-right">Amount</th><th></th></tr></thead>
+                            <tbody>
+                                {filteredExpenses.map(e => (
+                                    <tr key={e.id} className="border-b">
+                                        <td className="py-2">{new Date(e.date).toLocaleDateString()}</td>
+                                        <td>{e.category}</td>
+                                        <td className="text-gray-500">{e.note}</td>
+                                        <td className="text-right font-bold">₹{e.amount.toLocaleString()}</td>
+                                        <td className="text-red-500 cursor-pointer text-right" onClick={() => deleteExpense(e.id)}>x</td>
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                        {filteredExpenses.length === 0 && <p className="text-center text-gray-400 py-4">Koi expense record nahi hai.</p>}
+                    </div>
+                </div>
+            );
+        };
+
+        // ============================================================
+        // MAIN APP (post-login, active org member)
+        // ============================================================
+        const MainApp = ({ firebaseUser, userDoc }) => {
+            const [view, setView] = useState('pos');
+            const [org, setOrg] = useState(null);
+            const [products, setProducts] = useState([]);
+            const [sales, setSales] = useState([]);
+            const [lang, setLang] = useState(() => localStorage.getItem('buildmart_lang') || 'en');
+            const orgId = userDoc.orgId;
+            const isAdmin = userDoc.role === 'owner' || userDoc.role === 'admin';
+            const perms = userDoc.permissions || defaultPermissions();
+
+            const canPOS = isAdmin || perms.pos;
+            const canInventory = isAdmin || perms.inventory;
+            const canReports = isAdmin || perms.reports;
+            const canProfit = isAdmin || perms.profit;
+            const canKhata = isAdmin || perms.khata;
+            const canDashboard = isAdmin || perms.dashboard;
+
+            const changeLang = (l) => { setLang(l); localStorage.setItem('buildmart_lang', l); };
+
+            useEffect(() => {
+                const unsubOrg = db.collection('orgs').doc(orgId).onSnapshot(d => setOrg({ id: d.id, ...d.data() }));
+                const unsubProd = db.collection('orgs').doc(orgId).collection('products').orderBy('name').onSnapshot(snap => setProducts(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
+                const unsubSales = db.collection('orgs').doc(orgId).collection('sales').orderBy('date').onSnapshot(snap => setSales(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
+                return () => { unsubOrg(); unsubProd(); unsubSales(); };
+            }, [orgId]);
+
+            useEffect(() => {
+                // If current view isn't accessible (e.g. permissions just changed), fall back to the first one that is.
+                const allowed = { pos: canPOS, quotation: canPOS, inventory: canInventory, reports: canReports, profit: canProfit, khata: canKhata, dashboard: canDashboard, users: isAdmin, settings: isAdmin };
+                if (!allowed[view]) {
+                    const first = Object.keys(allowed).find(k => allowed[k]);
+                    if (first) setView(first);
+                }
+            }, [canPOS, canInventory, canReports, canProfit, canKhata, canDashboard, isAdmin]);
+
+            if (!org) return <div className="min-h-screen flex items-center justify-center">Loading...</div>;
+
+            const hasAnyAccess = canPOS || canInventory || canReports || canProfit || canKhata || canDashboard || isAdmin;
+            if (!hasAnyAccess) {
+                return (
+                    <div className="min-h-screen flex items-center justify-center bg-slate-800">
+                        <div className="bg-white p-8 rounded-lg shadow-xl w-96 text-center">
+                            <h2 className="text-xl font-bold mb-2 text-red-600">Koi Access Nahi</h2>
+                            <p className="text-gray-500 mb-6">Admin ne abhi tak aapko koi permission nahi di hai. Unse contact karein.</p>
+                            <button onClick={() => auth.signOut()} className="bg-red-600 text-white px-4 py-2 rounded font-bold">Logout</button>
+                        </div>
+                    </div>
+                );
+            }
+
+            return (
+                <div className="flex h-screen overflow-hidden">
+                    <div className="w-64 bg-slate-900 text-white flex flex-col no-print">
+                        <div className="p-4 text-center border-b border-slate-700">
+                            <h1 className="text-xl font-bold text-orange-500 truncate">{org.name}</h1>
+                            {org.address && <p className="text-xs text-slate-400 truncate">{org.address}</p>}
+                            <p className="text-xs mt-2 text-green-400">Welcome, {userDoc.name}</p>
+                            <select value={lang} onChange={e => changeLang(e.target.value)} className="mt-2 w-full bg-slate-800 text-white text-xs p-1 rounded border border-slate-600">
+                                {Object.keys(LANGUAGES).map(l => <option key={l} value={l}>{LANGUAGES[l]}</option>)}
+                            </select>
+                        </div>
+                        <nav className="flex-1 p-2 space-y-1 overflow-auto">
+                            {canDashboard && <button onClick={() => setView('dashboard')} className={`w-full text-left p-3 rounded ${view === 'dashboard' ? 'bg-slate-700' : ''}`}>{t(lang, 'nav_dashboard')}</button>}
+                            {canPOS && <button onClick={() => setView('pos')} className={`w-full text-left p-3 rounded ${view === 'pos' ? 'bg-slate-700' : ''}`}>{t(lang, 'nav_pos')}</button>}
+                            {canPOS && <button onClick={() => setView('quotation')} className={`w-full text-left p-3 rounded ${view === 'quotation' ? 'bg-slate-700' : ''}`}>{t(lang, 'nav_quotation')}</button>}
+                            {canInventory && <button onClick={() => setView('inventory')} className={`w-full text-left p-3 rounded ${view === 'inventory' ? 'bg-slate-700' : ''}`}>{t(lang, 'nav_inventory')}</button>}
+                            {canKhata && <button onClick={() => setView('khata')} className={`w-full text-left p-3 rounded ${view === 'khata' ? 'bg-slate-700' : ''}`}>{t(lang, 'nav_khata')}</button>}
+                            {canReports && <button onClick={() => setView('reports')} className={`w-full text-left p-3 rounded ${view === 'reports' ? 'bg-slate-700' : ''}`}>{t(lang, 'nav_reports')}</button>}
+                            {canProfit && <button onClick={() => setView('profit')} className={`w-full text-left p-3 rounded ${view === 'profit' ? 'bg-slate-700' : ''}`}>{t(lang, 'nav_profit')}</button>}
+                            {isAdmin && <button onClick={() => setView('users')} className={`w-full text-left p-3 rounded ${view === 'users' ? 'bg-slate-700' : ''}`}>{t(lang, 'nav_users')}</button>}
+                            {isAdmin && <button onClick={() => setView('settings')} className={`w-full text-left p-3 rounded ${view === 'settings' ? 'bg-slate-700' : ''}`}>{t(lang, 'nav_settings')}</button>}
+                        </nav>
+                        <button onClick={() => auth.signOut()} className="p-4 bg-red-600 hover:bg-red-700 m-2 rounded">{t(lang, 'nav_logout')}</button>
+                    </div>
+
+                    <div className="flex-1 bg-gray-100 h-full overflow-hidden flex flex-col">
+                        {view === 'dashboard' && canDashboard && <Dashboard sales={sales} products={products} lang={lang} />}
+                        {view === 'pos' && canPOS && <POS orgId={orgId} org={org} products={products} userDoc={userDoc} firebaseUser={firebaseUser} lang={lang} />}
+                        {view === 'inventory' && canInventory && <Inventory orgId={orgId} products={products} isAdmin={isAdmin} lang={lang} />}
+                        {view === 'khata' && canKhata && <KhataBook orgId={orgId} userDoc={userDoc} firebaseUser={firebaseUser} />}
+                        {view === 'reports' && canReports && <SalesReport sales={sales} userDoc={userDoc} />}
+                        {view === 'profit' && canProfit && <ProfitLoss orgId={orgId} sales={sales} />}
+                        {view === 'quotation' && canPOS && <Quotation products={products} org={org} />}
+                        {view === 'users' && isAdmin && <UserMgmt orgId={orgId} org={org} />}
+                        {view === 'settings' && isAdmin && <Settings orgId={orgId} org={org} />}
+                    </div>
+                </div>
+            );
+        };
+
+        // ============================================================
+        // ROOT APP (auth state machine)
+        // ============================================================
+        const App = () => {
+            const [authLoading, setAuthLoading] = useState(true);
+            const [firebaseUser, setFirebaseUser] = useState(null);
+            const [userDoc, setUserDoc] = useState(undefined); // undefined = loading, null = no profile
+            const [orgNameForPending, setOrgNameForPending] = useState('');
+
+            useEffect(() => {
+                const unsub = auth.onAuthStateChanged(u => {
+                    setFirebaseUser(u);
+                    setAuthLoading(false);
+                    if (!u) setUserDoc(undefined);
+                });
+                return unsub;
+            }, []);
+
+            useEffect(() => {
+                if (!firebaseUser) return;
+                setUserDoc(undefined);
+                const unsub = db.collection('users').doc(firebaseUser.uid).onSnapshot(
+                    doc => setUserDoc(doc.exists ? { id: doc.id, ...doc.data() } : null),
+                    () => setUserDoc(null)
+                );
+                return unsub;
+            }, [firebaseUser]);
+
+            useEffect(() => {
+                if (userDoc && userDoc.status === 'pending' && userDoc.orgId) {
+                    db.collection('orgs').doc(userDoc.orgId).get().then(d => {
+                        if (d.exists) setOrgNameForPending(d.data().name);
+                    });
+                }
+            }, [userDoc]);
+
+            if (authLoading) return <div className="min-h-screen flex items-center justify-center bg-slate-800 text-white">Loading...</div>;
+            if (!firebaseUser) return <Login />;
+            if (userDoc === undefined) return <div className="min-h-screen flex items-center justify-center bg-slate-800 text-white">Loading profile...</div>;
+            if (userDoc === null) return <Onboarding user={firebaseUser} />;
+            if (userDoc.status === 'pending') return <PendingApproval orgName={orgNameForPending} />;
+            if (userDoc.status === 'disabled') return (
+                <div className="min-h-screen flex items-center justify-center bg-slate-800">
+                    <div className="bg-white p-8 rounded-lg shadow-xl w-96 text-center">
+                        <h2 className="text-xl font-bold mb-2 text-red-600">Access Disabled</h2>
+                        <p className="text-gray-500 mb-6">Aapka access admin ne disable kar diya hai. Unse contact karein.</p>
+                        <button onClick={() => auth.signOut()} className="bg-red-600 text-white px-4 py-2 rounded font-bold">Logout</button>
+                    </div>
+                </div>
+            );
+            return <MainApp firebaseUser={firebaseUser} userDoc={userDoc} />;
+        };
+
+        // ============================================================
+        // PRINT TEMPLATE GENERATOR
+        // ============================================================
+        function generateReceiptHTML(data, org) {
+            org = org || { name: 'Business', address: '', mobile: '' };
+            const isEst = data.billType === 'Estimate';
+            const isQuote = data.billType === 'Quotation';
+
+            if (!isQuote) {
+                return `
+                    <div class="print-thermal">
+                        <center>
+                            <h2 style="margin:0">${org.name.toUpperCase()}</h2>
+                            <p style="margin:0; font-size:10px">${org.address || ''}</p>
+                            <p style="margin:0; font-size:10px">${org.mobile ? 'Mob: ' + org.mobile : ''}</p>
+                            <hr style="border-top: 1px dashed #000; margin: 5px 0;">
+                            <h3 style="margin:5px 0">${isEst ? 'ESTIMATE / CHALAN' : 'TAX INVOICE'}</h3>
+                        </center>
+                        <div style="display:flex; justify-content:space-between; font-size:10px;">
+                            <span>Bill: #${data.id.toString().slice(-6)}</span>
+                            <span>Date: ${new Date(data.date).toLocaleDateString()}</span>
+                        </div>
+                        <div style="font-size:10px;">Customer: ${data.customer.name || 'Cash Sale'}</div>
+                        <hr style="border-top: 1px dashed #000; margin: 5px 0;">
+                        <table style="width:100%; text-align:left; font-size:11px;">
+                            <thead><tr><th>Item</th><th style="text-align:right">Qty</th><th style="text-align:right">Amt</th></tr></thead>
+                            <tbody>${data.cart.map(i => `<tr><td>${i.name}</td><td style="text-align:right">${i.qty}</td><td style="text-align:right">${i.total}</td></tr>`).join('')}</tbody>
+                        </table>
+                        <hr style="border-top: 1px dashed #000; margin: 5px 0;">
+                        <div style="text-align:right; font-weight:bold; font-size:14px;">Total: ₹${data.grandTotal}</div>
+                        ${data.paymentMode === 'Udhar' ? '<div style="text-align:center; font-weight:bold; font-size:12px; border:1px dashed #000; padding:3px; margin-top:4px;">** UDHAR - PAYMENT PENDING **</div>' : ''}
+                        <center style="margin-top:10px; font-size:10px;">** Thank You Visit Again **</center>
+                    </div>`;
+            }
+
+            return `
+                <div class="print-a4">
+                    <div style="display:flex; justify-content:space-between; align-items:center; border-bottom:2px solid #333; padding-bottom:10px;">
+                        <div>
+                            <h1 style="color:#e65100; margin:0;">${org.name.toUpperCase()}</h1>
+                            <p style="margin:0; font-size:12px;">${org.address || ''} ${org.mobile ? '| Mob: ' + org.mobile : ''}</p>
+                            ${org.gstin ? `<p style="margin:0; font-size:12px;">GSTIN: ${org.gstin}</p>` : ''}
+                        </div>
+                        <div style="text-align:right;">
+                            <h2 style="margin:0; color:#333;">${data.billType.toUpperCase()}</h2>
+                            <p>Ref: ${data.id}</p>
+                            <p>Date: ${new Date(data.date).toLocaleDateString()}</p>
+                        </div>
+                    </div>
+                    <div style="margin:20px 0; padding:10px; background:#f5f5f5; border-radius:5px;">
+                        <strong>To:</strong> ${data.customer.name}<br>
+                        ${data.customer.address ? data.customer.address + '<br>' : ''}
+                        ${data.customer.gst ? 'GSTIN: ' + data.customer.gst : ''}
+                    </div>
+                    <table style="width:100%; border-collapse:collapse; margin-top:20px;">
+                        <thead style="background:#333; color:white;">
+                            <tr><th style="padding:10px; text-align:left;">#</th><th style="padding:10px; text-align:left;">Description</th><th style="padding:10px; text-align:center;">Qty</th><th style="padding:10px; text-align:right;">Rate</th><th style="padding:10px; text-align:right;">Total</th></tr>
+                        </thead>
+                        <tbody>
+                            ${data.cart.map((item, index) => `
+                                <tr style="border-bottom:1px solid #ddd;">
+                                    <td style="padding:10px;">${index + 1}</td>
+                                    <td style="padding:10px;">${item.name}</td>
+                                    <td style="padding:10px; text-align:center;">${item.qty} ${item.unit}</td>
+                                    <td style="padding:10px; text-align:right;">${item.price || item.priceSell}</td>
+                                    <td style="padding:10px; text-align:right;">${item.total}</td>
+                                </tr>`).join('')}
+                        </tbody>
+                    </table>
+                    <div style="margin-top:20px; text-align:right;">
+                        <h3 style="margin:0;">Grand Total: ₹${data.grandTotal}</h3>
+                    </div>
+                    <div style="margin-top:50px; display:flex; justify-content:space-between;">
+                        <div style="border-top:1px solid #000; padding-top:5px;">Customer Signature</div>
+                        <div style="border-top:1px solid #000; padding-top:5px;">Authorized Signatory</div>
+                    </div>
+                </div>`;
+        }
+
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+    </script>
+</body>
+</html>
