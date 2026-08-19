@@ -64,6 +64,23 @@
         const FieldValue = firebase.firestore.FieldValue;
         try { firebase.analytics(); } catch (e) { /* analytics not available (e.g. localhost) - safe to ignore */ }
 
+        // Staff accounts use "username + password" instead of Gmail. Under the
+        // hood Firebase Auth still needs an email-shaped address, so we
+        // silently append this fake domain — staff never see or type it.
+        const STAFF_EMAIL_DOMAIN = '@staff.buildmart.local';
+
+        // A SEPARATE Firebase app instance, used only when an admin creates a
+        // staff login. Without this, calling createUserWithEmailAndPassword()
+        // would sign the admin OUT of their own session and INTO the new
+        // staff account (Firebase Auth's default, unwanted behaviour here).
+        let _secondaryApp = null;
+        function getSecondaryAuth() {
+            if (!_secondaryApp) {
+                _secondaryApp = firebase.initializeApp(window.FIREBASE_CONFIG, 'StaffCreator');
+            }
+            return _secondaryApp.auth();
+        }
+
         const CATEGORIES = ['Hardware', 'Plumbing', 'Cement', 'Steel', 'Bath Fitting', 'AAC Blocks', 'Electrical', 'Paint', 'Other'];
         const UNITS = ['Pcs', 'Bags', 'Kg', 'Ton', 'Feet', 'Meter', 'Box', 'Litr'];
         const EXPENSE_CATEGORIES = ['Rent', 'Salary/Wages', 'Transport/Loading', 'Electricity Bill', 'Shop Maintenance', 'Other'];
@@ -145,6 +162,32 @@
         function catLabel(lang, val) { return (CATEGORY_LABELS[lang] && CATEGORY_LABELS[lang][val]) || val; }
         function unitLabel(lang, val) { return (UNIT_LABELS[lang] && UNIT_LABELS[lang][val]) || val; }
 
+        // Translated names for the common catalog items (so staff who don't
+        // read English can still recognize "Nails" as "कील / खिळे", etc.)
+        const ITEM_LABELS = {
+            hi: {
+                'Cement OPC 43': 'सीमेंट OPC 43', 'Cement OPC 53': 'सीमेंट OPC 53', 'Cement PPC': 'सीमेंट PPC', 'White Cement': 'सफेद सीमेंट',
+                'TMT Steel Bar': 'सरिया (TMT)', 'MS Angle': 'एमएस एंगल', 'MS Flat': 'एमएस फ्लैट', 'MS Pipe': 'एमएस पाइप', 'Binding Wire': 'बाइंडिंग तार', 'MS Channel': 'एमएस चैनल',
+                'Nails / Khile': 'कील', 'Screws': 'पेंच', 'Door Hinges': 'कब्जा', 'Tower Bolt': 'सिटकनी', 'Door Handle': 'हैंडल', 'Padlock': 'ताला', 'M-Seal': 'एम-सील', 'Measuring Tape': 'फीता', 'Hammer': 'हथौड़ी', 'Wire Mesh': 'जाली', 'Rope/Dori': 'रस्सी',
+                'CPVC Pipe': 'सीपीवीसी पाइप', 'PVC Pipe': 'पीवीसी पाइप', 'Elbow': 'एल्बो', 'Tee Joint': 'टी जॉइंट', 'Coupler': 'कपलर', 'Ball Valve': 'बॉल वाल्व', 'Bib Cock': 'बिब कॉक', 'Flush Tank': 'फ्लश टैंक', 'PTFE Tape': 'टेफ्लॉन टेप', 'Drain Pipe': 'ड्रेन पाइप',
+                'Interior Emulsion': 'इंटीरियर पेंट', 'Exterior Emulsion': 'एक्सटीरियर पेंट', 'Enamel Paint': 'एनामेल पेंट', 'Primer': 'प्राइमर', 'Distemper': 'डिस्टेंपर', 'Wall Putty': 'वॉल पुट्टी', 'Wood Polish': 'वुड पॉलिश', 'Texture Paint': 'टेक्सचर पेंट',
+                'Copper Wire': 'तांबे का तार', 'MCB': 'एमसीबी', 'Switch': 'स्विच', 'Socket': 'सॉकेट', 'LED Bulb': 'एलईडी बल्ब', 'Tube Light': 'ट्यूबलाइट', 'Ceiling Fan': 'पंखा', 'Extension Board': 'एक्सटेंशन बोर्ड', 'Switch Board': 'स्विच बोर्ड', 'Wire Roll': 'तार का रोल',
+                'Angle Valve': 'एंगल वाल्व', 'Health Faucet': 'हेल्थ फॉसेट', 'Shower': 'शावर', 'Wash Basin': 'वॉश बेसिन', 'Commode / WC': 'कमोड', 'Basin Mixer': 'बेसिन मिक्सर', 'Kitchen Sink': 'सिंक',
+                'AAC Block': 'AAC ब्लॉक'
+            },
+            mr: {
+                'Cement OPC 43': 'सिमेंट OPC 43', 'Cement OPC 53': 'सिमेंट OPC 53', 'Cement PPC': 'सिमेंट PPC', 'White Cement': 'पांढरे सिमेंट',
+                'TMT Steel Bar': 'सळई (TMT)', 'MS Angle': 'एमएस अँगल', 'MS Flat': 'एमएस फ्लॅट', 'MS Pipe': 'एमएस पाइप', 'Binding Wire': 'बाइंडिंग तार', 'MS Channel': 'एमएस चॅनेल',
+                'Nails / Khile': 'खिळे', 'Screws': 'स्क्रू', 'Door Hinges': 'बिजागरी', 'Tower Bolt': 'कडी', 'Door Handle': 'हँडल', 'Padlock': 'कुलूप', 'M-Seal': 'एम-सील', 'Measuring Tape': 'मापपट्टी', 'Hammer': 'हातोडी', 'Wire Mesh': 'जाळी', 'Rope/Dori': 'दोरी',
+                'CPVC Pipe': 'सीपीव्हीसी पाइप', 'PVC Pipe': 'पीव्हीसी पाइप', 'Elbow': 'एल्बो', 'Tee Joint': 'टी जॉइंट', 'Coupler': 'कपलर', 'Ball Valve': 'बॉल व्हॉल्व्ह', 'Bib Cock': 'बिब कॉक', 'Flush Tank': 'फ्लश टँक', 'PTFE Tape': 'टेफ्लॉन टेप', 'Drain Pipe': 'ड्रेन पाइप',
+                'Interior Emulsion': 'इंटीरियर पेंट', 'Exterior Emulsion': 'एक्सटीरियर पेंट', 'Enamel Paint': 'एनामेल पेंट', 'Primer': 'प्रायमर', 'Distemper': 'डिस्टेंपर', 'Wall Putty': 'वॉल पुट्टी', 'Wood Polish': 'वुड पॉलिश', 'Texture Paint': 'टेक्श्चर पेंट',
+                'Copper Wire': 'तांब्याची तार', 'MCB': 'एमसीबी', 'Switch': 'स्विच', 'Socket': 'सॉकेट', 'LED Bulb': 'एलईडी बल्ब', 'Tube Light': 'ट्यूबलाइट', 'Ceiling Fan': 'पंखा', 'Extension Board': 'एक्सटेंशन बोर्ड', 'Switch Board': 'स्विच बोर्ड', 'Wire Roll': 'तारेचा रोल',
+                'Angle Valve': 'अँगल व्हॉल्व्ह', 'Health Faucet': 'हेल्थ फॉसेट', 'Shower': 'शॉवर', 'Wash Basin': 'वॉश बेसिन', 'Commode / WC': 'कमोड', 'Basin Mixer': 'बेसिन मिक्सर', 'Kitchen Sink': 'सिंक',
+                'AAC Block': 'AAC ब्लॉक'
+            }
+        };
+        function itemLabel(lang, val) { return (ITEM_LABELS[lang] && ITEM_LABELS[lang][val]) || val; }
+
         const TRANSLATIONS = {
             en: {
                 nav_dashboard: 'Dashboard', nav_pos: 'Counter Billing (POS)', nav_quotation: 'Quotation (A4)',
@@ -211,8 +254,11 @@
         // 1. LOGIN (Google Sign-In)
         // ============================================================
         const Login = () => {
+            const [mode, setMode] = useState('google'); // 'google' | 'staff'
             const [busy, setBusy] = useState(false);
             const [err, setErr] = useState('');
+            const [username, setUsername] = useState('');
+            const [password, setPassword] = useState('');
 
             const handleGoogleLogin = async () => {
                 setErr('');
@@ -227,20 +273,59 @@
                 }
             };
 
+            const handleStaffLogin = async (e) => {
+                e.preventDefault();
+                if (!username.trim() || !password) return;
+                setErr('');
+                setBusy(true);
+                try {
+                    await auth.signInWithEmailAndPassword(username.trim().toLowerCase() + STAFF_EMAIL_DOMAIN, password);
+                } catch (e2) {
+                    setErr('Galat username ya password.');
+                } finally {
+                    setBusy(false);
+                }
+            };
+
             return (
                 <div className="min-h-screen flex items-center justify-center bg-slate-800">
                     <div className="bg-white p-8 rounded-lg shadow-xl w-96 text-center">
                         <h1 className="text-2xl font-bold text-slate-800 mb-1">BuildMart POS</h1>
-                        <p className="text-gray-500 mb-6">Hardware & Building Material SaaS</p>
-                        <button
-                            onClick={handleGoogleLogin}
-                            disabled={busy}
-                            className="w-full flex items-center justify-center gap-3 border-2 border-gray-200 hover:bg-gray-50 text-gray-700 p-3 rounded font-bold disabled:opacity-50">
-                            <svg width="20" height="20" viewBox="0 0 48 48"><path fill="#FFC107" d="M43.6 20.5h-1.9V20H24v8h11.3c-1.6 4.7-6.1 8-11.3 8-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.1 8 3l6-6C34.6 5.1 29.6 3 24 3 12.4 3 3 12.4 3 24s9.4 21 21 21 21-9.4 21-21c0-1.4-.1-2.7-.4-3.5z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.6 15.9 18.9 13 24 13c3.1 0 5.8 1.1 8 3l6-6C34.6 5.1 29.6 3 24 3 16.3 3 9.7 7.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 45c5.5 0 10.5-2.1 14.3-5.6l-6.6-5.6C29.6 35.6 27 36.5 24 36.5c-5.2 0-9.6-3.3-11.3-8l-6.6 5.1C9.6 40.6 16.3 45 24 45z"/><path fill="#1976D2" d="M43.6 20.5H24v8h11.3c-.8 2.3-2.2 4.2-4.1 5.6l6.6 5.6C41.4 36.6 45 30.9 45 24c0-1.4-.1-2.7-.4-3.5z"/></svg>
-                            {busy ? 'Signing in...' : 'Continue with Google'}
-                        </button>
+                        <p className="text-gray-500 mb-6">Hardware & Building Material Store</p>
+
+                        <div className="flex mb-5 border rounded overflow-hidden">
+                            <button onClick={() => { setMode('google'); setErr(''); }} className={`flex-1 py-2 text-sm font-bold ${mode === 'google' ? 'bg-slate-800 text-white' : 'bg-white text-gray-500'}`}>Owner / Admin</button>
+                            <button onClick={() => { setMode('staff'); setErr(''); }} className={`flex-1 py-2 text-sm font-bold ${mode === 'staff' ? 'bg-slate-800 text-white' : 'bg-white text-gray-500'}`}>Staff Login</button>
+                        </div>
+
+                        {mode === 'google' && (
+                            <>
+                                <button
+                                    onClick={handleGoogleLogin}
+                                    disabled={busy}
+                                    className="w-full flex items-center justify-center gap-3 border-2 border-gray-200 hover:bg-gray-50 text-gray-700 p-3 rounded font-bold disabled:opacity-50">
+                                    <svg width="20" height="20" viewBox="0 0 48 48"><path fill="#FFC107" d="M43.6 20.5h-1.9V20H24v8h11.3c-1.6 4.7-6.1 8-11.3 8-6.6 0-12-5.4-12-12s5.4-12 12-12c3.1 0 5.8 1.1 8 3l6-6C34.6 5.1 29.6 3 24 3 12.4 3 3 12.4 3 24s9.4 21 21 21 21-9.4 21-21c0-1.4-.1-2.7-.4-3.5z"/><path fill="#FF3D00" d="M6.3 14.7l6.6 4.8C14.6 15.9 18.9 13 24 13c3.1 0 5.8 1.1 8 3l6-6C34.6 5.1 29.6 3 24 3 16.3 3 9.7 7.3 6.3 14.7z"/><path fill="#4CAF50" d="M24 45c5.5 0 10.5-2.1 14.3-5.6l-6.6-5.6C29.6 35.6 27 36.5 24 36.5c-5.2 0-9.6-3.3-11.3-8l-6.6 5.1C9.6 40.6 16.3 45 24 45z"/><path fill="#1976D2" d="M43.6 20.5H24v8h11.3c-.8 2.3-2.2 4.2-4.1 5.6l6.6 5.6C41.4 36.6 45 30.9 45 24c0-1.4-.1-2.7-.4-3.5z"/></svg>
+                                    {busy ? 'Signing in...' : 'Continue with Google'}
+                                </button>
+                                <p className="text-xs text-gray-400 mt-6">Naye users ko admin approval chahiye hoga.</p>
+                            </>
+                        )}
+
+                        {mode === 'staff' && (
+                            <form onSubmit={handleStaffLogin} className="space-y-3 text-left">
+                                <div>
+                                    <label className="block text-sm font-medium mb-1">Username</label>
+                                    <input autoFocus autoCapitalize="off" className="w-full border p-2 rounded" value={username} onChange={e => setUsername(e.target.value)} required />
+                                </div>
+                                <div>
+                                    <label className="block text-sm font-medium mb-1">Password</label>
+                                    <input type="password" className="w-full border p-2 rounded" value={password} onChange={e => setPassword(e.target.value)} required />
+                                </div>
+                                <button disabled={busy} className="w-full bg-orange-600 hover:bg-orange-700 text-white p-3 rounded font-bold disabled:opacity-50">{busy ? 'Signing in...' : 'Login'}</button>
+                                <p className="text-xs text-gray-400 text-center">Ye login admin ne banaya hoga. Agar nahi hai to admin se banwayein.</p>
+                            </form>
+                        )}
                         {err && <p className="text-red-500 text-sm mt-3">{err}</p>}
-                        <p className="text-xs text-gray-400 mt-6">Naye users ko admin approval chahiye hoga.</p>
                     </div>
                 </div>
             );
@@ -461,6 +546,7 @@
             const [restockProd, setRestockProd] = useState(null); // set when an existing product is picked
             const [supplier, setSupplier] = useState({ name: '', mobile: '' });
             const [purchaseMode, setPurchaseMode] = useState('Cash'); // Cash | Udhar (admin only, tracks supplier khata)
+            const [purchaseGstIncluded, setPurchaseGstIncluded] = useState(false); // is GST already included in Purchase Rate?
             const [quickBase, setQuickBase] = useState(''); // base item picked from catalog, e.g. "TMT Steel Bar"
             const nameRef = useRef();
 
@@ -473,6 +559,7 @@
                 setSuggestions([]);
                 setSupplier({ name: '', mobile: '' });
                 setPurchaseMode('Cash');
+                setPurchaseGstIncluded(false);
                 setQuickBase('');
             };
 
@@ -526,6 +613,10 @@
 
                 const stockQty = Number(form.stock) || 0;
                 const buyRate = Number(form.priceBuy) || 0;
+                const gstPct = Number(form.gst) || 0;
+                const purchaseCost = buyRate * stockQty;
+                const purchaseGstAmt = purchaseGstIncluded ? 0 : purchaseCost * (gstPct / 100);
+                const purchaseTotal = purchaseCost + purchaseGstAmt; // what's actually payable to the supplier
                 const isSupplierUdhar = isAdmin && purchaseMode === 'Udhar' && supplier.name.trim() && stockQty > 0;
 
                 let supplierPartyRef = null;
@@ -546,29 +637,28 @@
                     batch.update(productRef, {
                         category: form.category, unit: form.unit, brand: form.brand || '', spec: form.spec || '',
                         priceBuy: buyRate, priceSell: Number(form.priceSell),
-                        gst: Number(form.gst) || 0, discount: Number(form.discount) || 0,
+                        gst: gstPct, discount: Number(form.discount) || 0,
                         stock: FieldValue.increment(stockQty)
                     });
                 } else {
                     batch.set(productRef, {
                         name: form.name, category: form.category, unit: form.unit, brand: form.brand || '', spec: form.spec || '',
                         priceBuy: buyRate, priceSell: Number(form.priceSell),
-                        stock: stockQty, gst: Number(form.gst) || 0, discount: Number(form.discount) || 0,
+                        stock: stockQty, gst: gstPct, discount: Number(form.discount) || 0,
                         createdAt: FieldValue.serverTimestamp()
                     });
                 }
 
                 if (isSupplierUdhar) {
-                    const cost = buyRate * stockQty;
                     batch.set(supplierPartyRef, {
                         name: supplier.name, mobile: supplier.mobile || '', type: 'supplier',
-                        balance: FieldValue.increment(cost),
+                        balance: FieldValue.increment(purchaseTotal),
                         createdAt: FieldValue.serverTimestamp()
                     }, { merge: true });
                     const txnRef = supplierPartyRef.collection('transactions').doc();
                     batch.set(txnRef, {
-                        type: 'purchase_credit', amount: cost,
-                        note: `${form.name} x ${stockQty} ${form.unit}`,
+                        type: 'purchase_credit', amount: purchaseTotal,
+                        note: `${form.name} x ${stockQty} ${form.unit}${purchaseGstAmt > 0 ? ` (incl. GST ₹${purchaseGstAmt.toFixed(2)})` : ''}`,
                         date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp()
                     });
                 }
@@ -618,7 +708,7 @@
                                     {catalogEntry.items.map(it => (
                                         <button type="button" key={it} onClick={() => pickQuickItem(it)}
                                             className={`px-2 py-1 rounded text-xs border ${quickBase === it ? 'bg-blue-600 text-white border-blue-600' : 'bg-white text-gray-700 hover:bg-blue-50'}`}>
-                                            {it}
+                                            {itemLabel(lang, it)}
                                         </button>
                                     ))}
                                 </div>
@@ -687,8 +777,29 @@
                                         </>
                                     )}
                                 </div>
-                                {purchaseMode === 'Udhar' && supplier.name.trim() && (
-                                    <p className="text-xs text-red-600 mt-1">₹{((Number(form.priceBuy) || 0) * (Number(form.stock) || 0)).toLocaleString()} <strong>{supplier.name}</strong> ke Khata Book me "payable" ke roop me add hoga.</p>
+
+                                {Number(form.priceBuy) > 0 && (() => {
+                                    const qty = Number(form.stock) || 0;
+                                    const rate = Number(form.priceBuy) || 0;
+                                    const gstPct = Number(form.gst) || 0;
+                                    const cost = rate * qty;
+                                    const gstAmt = purchaseGstIncluded ? 0 : cost * (gstPct / 100);
+                                    const total = cost + gstAmt;
+                                    return (
+                                        <div className="mt-2 bg-yellow-50 border border-yellow-200 rounded p-2 text-sm">
+                                            <label className="flex items-center gap-2 text-xs text-gray-600 mb-2 cursor-pointer">
+                                                <input type="checkbox" checked={purchaseGstIncluded} onChange={e => setPurchaseGstIncluded(e.target.checked)} />
+                                                Purchase Rate me GST already included hai (supplier alag se GST nahi jodega)
+                                            </label>
+                                            <div className="flex justify-between"><span>Subtotal ({qty} × ₹{rate})</span><span>₹{cost.toLocaleString()}</span></div>
+                                            {!purchaseGstIncluded && <div className="flex justify-between"><span>+ GST ({gstPct}%)</span><span>₹{gstAmt.toFixed(2)}</span></div>}
+                                            <div className="flex justify-between font-bold border-t mt-1 pt-1"><span>Total Purchase Bill</span><span>₹{total.toLocaleString()}</span></div>
+                                        </div>
+                                    );
+                                })()}
+
+                                {purchaseMode === 'Udhar' && supplier.name.trim() && Number(form.priceBuy) > 0 && (
+                                    <p className="text-xs text-red-600 mt-2">Ye poori total amount (GST sahit) <strong>{supplier.name}</strong> ke Khata Book me "payable" ke roop me add hogi.</p>
                                 )}
                             </div>
                         )}
@@ -741,6 +852,7 @@
             const [catFilter, setCatFilter] = useState('All');
             const [selectedProd, setSelectedProd] = useState(null);
             const [qtyInput, setQtyInput] = useState('');
+            const [discInput, setDiscInput] = useState('');
             const [billType, setBillType] = useState('Estimate');
             const [paymentMode, setPaymentMode] = useState('Cash'); // Cash | Udhar
             const [customer, setCustomer] = useState({ name: '', mobile: '', gst: '', address: '' });
@@ -752,7 +864,8 @@
             useEffect(() => {
                 const handleKey = (e) => {
                     if (e.key === 'F2') { e.preventDefault(); searchRef.current && searchRef.current.focus(); }
-                    if (e.key === 'F9') { e.preventDefault(); handlePrint(); }
+                    if (e.key === 'F9') { e.preventDefault(); completeSale(true); }
+                    if (e.key === 'F8') { e.preventDefault(); completeSale(false); }
                 };
                 window.addEventListener('keydown', handleKey);
                 return () => window.removeEventListener('keydown', handleKey);
@@ -772,16 +885,18 @@
                 if (!qtyInput || Number(qtyInput) <= 0) return;
                 const qty = Number(qtyInput);
                 if (selectedProd.stock < qty) { alert(`Stock kam hai! Available: ${selectedProd.stock}`); return; }
-                const finalPrice = selectedProd.priceSell - (selectedProd.priceSell * (selectedProd.discount / 100));
-                const newItem = { ...selectedProd, qty, finalPrice, total: finalPrice * qty, profit: (finalPrice - selectedProd.priceBuy) * qty };
+                const disc = discInput === '' ? 0 : Number(discInput);
+                const finalPrice = selectedProd.priceSell - (selectedProd.priceSell * (disc / 100));
+                const newItem = { ...selectedProd, qty, discount: disc, finalPrice, total: finalPrice * qty, profit: (finalPrice - selectedProd.priceBuy) * qty };
                 setCart([...cart, newItem]);
-                setSelectedProd(null); setQtyInput(''); setQuery('');
+                setSelectedProd(null); setQtyInput(''); setDiscInput(''); setQuery('');
                 searchRef.current.focus();
             };
 
             const selectProduct = (prod) => {
                 setSelectedProd(prod);
                 setQtyInput('');
+                setDiscInput(prod.discount || 0); // pre-fill with product's default discount, but staff can change it for this sale
                 setTimeout(() => qtyRef.current && qtyRef.current.focus(), 100);
             };
 
@@ -791,18 +906,21 @@
                 }
             };
 
-            const handlePrint = async () => {
+            const completeSale = async (shouldPrint) => {
                 if (cart.length === 0) return alert('Cart Empty!');
                 if (paymentMode === 'Udhar' && !customer.name.trim()) { alert('Udhar ke liye Customer Name daalna zaroori hai!'); return; }
                 if (saving) return;
                 setSaving(true);
                 try {
-                    const grandTotal = cart.reduce((sum, item) => sum + item.total, 0);
+                    const subtotal = cart.reduce((sum, item) => sum + item.total, 0);
+                    const gstAmount = billType === 'Tax Invoice' ? cart.reduce((sum, item) => sum + item.total * ((item.gst || 0) / 100), 0) : 0;
+                    const grandTotal = subtotal + gstAmount;
                     const totalProfit = cart.reduce((sum, item) => sum + (item.profit || 0), 0);
                     const saleData = {
                         date: new Date().toISOString(),
                         createdAt: FieldValue.serverTimestamp(),
-                        customer, cart, grandTotal, totalProfit, billType, paymentMode,
+                        customer, cart, subtotal, gstAmount, grandTotal, totalProfit, billType, paymentMode,
+                        printed: shouldPrint,
                         staffUid: firebaseUser.uid,
                         staffName: userDoc.name,
                         staffEmail: userDoc.email
@@ -842,10 +960,14 @@
                         });
                     }
 
+                    // Sale is ALWAYS saved to Firestore regardless of whether it's printed —
+                    // printing is just an optional extra step on top.
                     await batch.commit();
 
-                    document.getElementById('print-content').innerHTML = generateReceiptHTML({ ...saleData, id: saleRef.id }, org);
-                    window.print();
+                    if (shouldPrint) {
+                        document.getElementById('print-content').innerHTML = generateReceiptHTML({ ...saleData, id: saleRef.id }, org);
+                        window.print();
+                    }
 
                     setCart([]); setCustomer({ name: '', mobile: '', gst: '', address: '' }); setQuery(''); setPaymentMode('Cash');
                 } catch (e) {
@@ -855,7 +977,11 @@
                 }
             };
 
-            const totals = useMemo(() => cart.reduce((s, i) => s + i.total, 0), [cart]);
+            const totals = useMemo(() => {
+                const subtotal = cart.reduce((s, i) => s + i.total, 0);
+                const gstAmount = billType === 'Tax Invoice' ? cart.reduce((s, i) => s + i.total * ((i.gst || 0) / 100), 0) : 0;
+                return { subtotal, gstAmount, grandTotal: subtotal + gstAmount };
+            }, [cart, billType]);
 
             return (
                 <div className="flex h-full gap-4 p-4">
@@ -910,6 +1036,11 @@
                                     <input className={`border p-1 rounded text-sm ${billType === 'Tax Invoice' ? 'w-1/3' : 'w-full'}`} placeholder="Mobile" value={customer.mobile} onChange={e => setCustomer({ ...customer, mobile: e.target.value })} />
                                 </div>
                             )}
+                            <p className="text-xs text-gray-400">
+                                {billType === 'Tax Invoice'
+                                    ? 'Tax Invoice: har item ke GST% ke hisaab se bill me tax apne aap add ho jayega.'
+                                    : 'Estimate: bina GST ke, sirf rate × qty (no tax added).'}
+                            </p>
                         </div>
                         <div className="flex-1 overflow-auto p-2">
                             <table className="w-full text-sm">
@@ -927,13 +1058,26 @@
                             </table>
                         </div>
                         <div className="p-4 bg-white border-t">
+                            {billType === 'Tax Invoice' && totals.gstAmount > 0 && (
+                                <div className="text-sm text-gray-500 space-y-0.5 mb-2">
+                                    <div className="flex justify-between"><span>Subtotal</span><span>₹{totals.subtotal.toFixed(2)}</span></div>
+                                    <div className="flex justify-between"><span>CGST</span><span>₹{(totals.gstAmount / 2).toFixed(2)}</span></div>
+                                    <div className="flex justify-between"><span>SGST</span><span>₹{(totals.gstAmount / 2).toFixed(2)}</span></div>
+                                </div>
+                            )}
                             <div className="flex justify-between items-center mb-4">
                                 <span className="text-gray-500">Total Items: {cart.length}</span>
-                                <span className="text-3xl font-bold text-slate-800">₹{totals}</span>
+                                <span className="text-3xl font-bold text-slate-800">₹{totals.grandTotal.toFixed(2)}</span>
                             </div>
-                            <button onClick={handlePrint} disabled={saving} className={`w-full text-white py-3 rounded font-bold text-lg shadow disabled:opacity-50 ${paymentMode === 'Udhar' ? 'bg-red-600 hover:bg-red-700' : 'bg-green-600 hover:bg-green-700'}`}>
-                                {saving ? 'Saving...' : (paymentMode === 'Udhar' ? 'Save as Udhar (F9)' : 'Print & Save (F9)')}
-                            </button>
+                            <div className="grid grid-cols-2 gap-2">
+                                <button onClick={() => completeSale(false)} disabled={saving} className="w-full bg-slate-700 hover:bg-slate-800 text-white py-3 rounded font-bold shadow disabled:opacity-50">
+                                    {saving ? 'Saving...' : 'Save Only (F8)'}
+                                </button>
+                                <button onClick={() => completeSale(true)} disabled={saving} className={`w-full text-white py-3 rounded font-bold shadow disabled:opacity-50 ${paymentMode === 'Udhar' ? 'bg-red-600 hover:bg-red-700' : 'bg-green-600 hover:bg-green-700'}`}>
+                                    {saving ? 'Saving...' : (paymentMode === 'Udhar' ? 'Save as Udhar (F9)' : 'Print & Save (F9)')}
+                                </button>
+                            </div>
+                            <p className="text-xs text-gray-400 text-center mt-2">"Save Only" se bill data hamesha save hota hai — print karna zaroori nahi hai.</p>
                         </div>
                     </div>
 
@@ -943,7 +1087,14 @@
                                 <h3 className="font-bold text-lg mb-2">{selectedProd.name}</h3>
                                 <div className="flex justify-between text-sm text-gray-600 mb-4"><span>Stock: {selectedProd.stock}</span><span>Rate: ₹{selectedProd.priceSell}</span></div>
                                 <label className="block text-sm font-bold mb-1">Enter Quantity ({selectedProd.unit})</label>
-                                <input ref={qtyRef} type="number" step="0.01" className="w-full border-2 border-blue-500 rounded p-2 text-2xl font-bold text-center mb-4" value={qtyInput} onChange={e => setQtyInput(e.target.value)} />
+                                <input ref={qtyRef} type="number" step="0.01" className="w-full border-2 border-blue-500 rounded p-2 text-2xl font-bold text-center mb-3" value={qtyInput} onChange={e => setQtyInput(e.target.value)} />
+                                <label className="block text-sm font-bold mb-1">Discount % (is sale ke liye)</label>
+                                <input type="number" step="0.01" min="0" max="100" className="w-full border-2 border-orange-400 rounded p-2 text-lg font-bold text-center mb-2" value={discInput} onChange={e => setDiscInput(e.target.value)} />
+                                {qtyInput && Number(qtyInput) > 0 && (
+                                    <p className="text-center text-sm text-gray-600 mb-3">
+                                        Final Rate: ₹{(selectedProd.priceSell - selectedProd.priceSell * ((Number(discInput) || 0) / 100)).toFixed(2)} ×  {qtyInput} = <strong>₹{((selectedProd.priceSell - selectedProd.priceSell * ((Number(discInput) || 0) / 100)) * Number(qtyInput)).toFixed(2)}</strong>
+                                    </p>
+                                )}
                                 <div className="grid grid-cols-2 gap-2">
                                     <button type="button" onClick={() => setSelectedProd(null)} className="bg-gray-200 p-2 rounded">Cancel</button>
                                     <button type="submit" className="bg-blue-600 text-white p-2 rounded font-bold">Add (Enter)</button>
@@ -972,13 +1123,29 @@
             }).slice().reverse();
 
             const downloadExcel = () => {
-                let csv = 'ID,Date,Customer,Staff,Bill Type,Amount\n';
-                filteredSales.forEach(s => { csv += `${s.id},${new Date(s.date).toLocaleDateString()},${s.customer.name},${s.staffName},${s.billType},${s.grandTotal}\n`; });
+                let csv = 'ID,Date,Customer,Staff,Bill Type,Payment,Amount\n';
+                filteredSales.forEach(s => { csv += `${s.id},${new Date(s.date).toLocaleDateString()},${s.customer.name},${s.staffName},${s.billType},${s.paymentMode || 'Cash'},${s.grandTotal}\n`; });
                 const blob = new Blob([csv], { type: 'text/csv' });
                 const url = window.URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = url; a.download = `Sales_Report_${new Date().toISOString().slice(0, 10)}.csv`; a.click();
             };
+
+            // Staff-wise summary: who sold how much, and how much cash they should
+            // physically have vs. how much went on udhar (credit, not collected yet).
+            const staffSummary = useMemo(() => {
+                if (!isAdmin) return [];
+                const map = {};
+                filteredSales.forEach(s => {
+                    const key = s.staffUid || 'unknown';
+                    if (!map[key]) map[key] = { staffName: s.staffName || 'Unknown', bills: 0, cashTotal: 0, udharTotal: 0, grandTotal: 0 };
+                    map[key].bills++;
+                    map[key].grandTotal += s.grandTotal || 0;
+                    if (s.paymentMode === 'Udhar') map[key].udharTotal += s.grandTotal || 0;
+                    else map[key].cashTotal += s.grandTotal || 0;
+                });
+                return Object.values(map).sort((a, b) => b.grandTotal - a.grandTotal);
+            }, [filteredSales, isAdmin]);
 
             return (
                 <div className="p-6 overflow-auto">
@@ -988,9 +1155,33 @@
                         <div className="flex-1"><label className="text-xs font-bold block">Search ID/Customer</label><input className="border p-2 rounded w-full" value={searchTerm} onChange={e => setSearchTerm(e.target.value)} placeholder="Name or Bill ID" /></div>
                         <button onClick={downloadExcel} className="bg-green-600 text-white p-2 rounded font-bold">Export Excel</button>
                     </div>
+
+                    {isAdmin && staffSummary.length > 0 && (
+                        <div className="bg-white rounded shadow overflow-hidden mb-6">
+                            <div className="p-3 bg-gray-50 border-b font-bold">Staff-wise Summary — Kisne Kitna Becha, Kitna Cash Aana Chahiye</div>
+                            <table className="w-full text-sm">
+                                <thead className="text-left text-gray-500 border-b">
+                                    <tr><th className="p-2">Staff</th><th className="p-2">Bills</th><th className="p-2 text-right">Cash Sales</th><th className="p-2 text-right">Udhar Sales</th><th className="p-2 text-right">Total</th></tr>
+                                </thead>
+                                <tbody>
+                                    {staffSummary.map(s => (
+                                        <tr key={s.staffName} className="border-b hover:bg-gray-50">
+                                            <td className="p-2 font-bold">{s.staffName}</td>
+                                            <td className="p-2">{s.bills}</td>
+                                            <td className="p-2 text-right text-green-700 font-bold">₹{s.cashTotal.toLocaleString()}</td>
+                                            <td className="p-2 text-right text-red-600">₹{s.udharTotal.toLocaleString()}</td>
+                                            <td className="p-2 text-right font-bold">₹{s.grandTotal.toLocaleString()}</td>
+                                        </tr>
+                                    ))}
+                                </tbody>
+                            </table>
+                            <p className="text-xs text-gray-400 p-2">"Cash Sales" column jitna cash us staff ke paas physically hona chahiye (Udhar wale paise abhi collect nahi hue).</p>
+                        </div>
+                    )}
+
                     <div className="bg-white rounded shadow overflow-hidden">
                         <table className="w-full text-sm">
-                            <thead className="bg-gray-100 border-b"><tr><th className="p-3 text-left">Bill ID</th><th className="p-3 text-left">Date</th><th className="p-3 text-left">Customer</th><th className="p-3 text-left">Type</th><th className="p-3 text-left">Staff</th><th className="p-3 text-right">Amount</th></tr></thead>
+                            <thead className="bg-gray-100 border-b"><tr><th className="p-3 text-left">Bill ID</th><th className="p-3 text-left">Date</th><th className="p-3 text-left">Customer</th><th className="p-3 text-left">Type</th><th className="p-3 text-left">Payment</th><th className="p-3 text-left">Staff</th><th className="p-3 text-right">Amount</th></tr></thead>
                             <tbody>
                                 {filteredSales.map(s => (
                                     <tr key={s.id} className="border-b hover:bg-gray-50">
@@ -998,6 +1189,7 @@
                                         <td className="p-3">{new Date(s.date).toLocaleString()}</td>
                                         <td className="p-3 font-bold">{s.customer.name || 'Walk-in'}</td>
                                         <td className="p-3"><span className={`px-2 py-1 rounded text-xs ${s.billType === 'Estimate' ? 'bg-yellow-100 text-yellow-800' : 'bg-blue-100 text-blue-800'}`}>{s.billType}</span></td>
+                                        <td className="p-3"><span className={`px-2 py-1 rounded text-xs ${s.paymentMode === 'Udhar' ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}`}>{s.paymentMode || 'Cash'}</span></td>
                                         <td className="p-3">{s.staffName}</td>
                                         <td className="p-3 text-right font-bold">₹{s.grandTotal}</td>
                                     </tr>
@@ -1102,6 +1294,11 @@
         const UserMgmt = ({ orgId, org }) => {
             const [users, setUsers] = useState([]);
             const [expandedId, setExpandedId] = useState(null);
+            const [staffForm, setStaffForm] = useState({ name: '', username: '', password: '' });
+            const [staffPerms, setStaffPerms] = useState(defaultPermissions());
+            const [creating, setCreating] = useState(false);
+            const [createErr, setCreateErr] = useState('');
+            const [createOk, setCreateOk] = useState('');
 
             useEffect(() => {
                 const unsub = db.collection('users').where('orgId', '==', orgId).onSnapshot(snap => {
@@ -1112,6 +1309,7 @@
 
             const pending = users.filter(u => u.status === 'pending');
             const active = users.filter(u => u.status === 'active');
+            const isStaffLogin = (u) => (u.email || '').endsWith(STAFF_EMAIL_DOMAIN);
 
             const approve = async (u, role) => {
                 const update = { status: 'active', role: role || 'staff' };
@@ -1138,12 +1336,67 @@
             };
             const reEnable = async (u) => { await db.collection('users').doc(u.id).update({ status: 'active' }); };
 
+            const createStaffLogin = async (e) => {
+                e.preventDefault();
+                setCreateErr(''); setCreateOk('');
+                const uname = staffForm.username.trim().toLowerCase().replace(/\s+/g, '');
+                if (!staffForm.name.trim() || !uname || staffForm.password.length < 6) {
+                    setCreateErr('Naam, username bharo aur password kam se kam 6 characters ka rakho.');
+                    return;
+                }
+                setCreating(true);
+                try {
+                    const secAuth = getSecondaryAuth();
+                    const cred = await secAuth.createUserWithEmailAndPassword(uname + STAFF_EMAIL_DOMAIN, staffForm.password);
+                    await cred.user.updateProfile({ displayName: staffForm.name.trim() });
+                    await db.collection('users').doc(cred.user.uid).set({
+                        uid: cred.user.uid, name: staffForm.name.trim(), email: cred.user.email, photoURL: '',
+                        orgId, role: 'staff', status: 'active', permissions: staffPerms,
+                        createdAt: FieldValue.serverTimestamp()
+                    });
+                    await secAuth.signOut();
+                    setCreateOk(`"${staffForm.name.trim()}" ka login ban gaya! Username: ${uname}`);
+                    setStaffForm({ name: '', username: '', password: '' });
+                    setStaffPerms(defaultPermissions());
+                } catch (e2) {
+                    if (e2.code === 'auth/email-already-in-use') setCreateErr('Ye username pehle se liya hua hai, dusra try karo.');
+                    else if (e2.code === 'auth/weak-password') setCreateErr('Password kamzor hai, kam se kam 6 characters rakho.');
+                    else setCreateErr(e2.message);
+                } finally {
+                    setCreating(false);
+                }
+            };
+
             return (
                 <div className="p-6 overflow-auto">
                     <h2 className="text-xl font-bold mb-4">Staff & Admin Management</h2>
+
+                    <div className="bg-white p-4 rounded shadow mb-6 max-w-2xl border-l-4 border-orange-500">
+                        <h3 className="font-bold mb-1">Staff Login Banayein (Username + Password)</h3>
+                        <p className="text-xs text-gray-500 mb-3">Isse staff ko Gmail ki zaroorat nahi — seedha login active ho jata hai, approval ka wait nahi karna padta.</p>
+                        <form onSubmit={createStaffLogin} className="grid grid-cols-1 md:grid-cols-3 gap-2 mb-3">
+                            <input placeholder="Staff ka Naam" className="border p-2 rounded" value={staffForm.name} onChange={e => setStaffForm({ ...staffForm, name: e.target.value })} required />
+                            <input placeholder="Username (jaise ramesh)" className="border p-2 rounded" value={staffForm.username} onChange={e => setStaffForm({ ...staffForm, username: e.target.value })} required />
+                            <input type="password" placeholder="Password (min 6 chars)" className="border p-2 rounded" value={staffForm.password} onChange={e => setStaffForm({ ...staffForm, password: e.target.value })} required />
+                        </form>
+                        <div className="grid grid-cols-2 gap-1 mb-3 bg-gray-50 p-3 rounded">
+                            {Object.keys(PERMISSION_LABELS).map(key => (
+                                <label key={key} className="flex items-center gap-2 text-sm cursor-pointer">
+                                    <input type="checkbox" checked={!!staffPerms[key]} onChange={() => setStaffPerms({ ...staffPerms, [key]: !staffPerms[key] })} />
+                                    {PERMISSION_LABELS[key]}
+                                </label>
+                            ))}
+                        </div>
+                        {createErr && <p className="text-red-600 text-sm mb-2">{createErr}</p>}
+                        {createOk && <p className="text-green-600 text-sm mb-2 font-bold">{createOk}</p>}
+                        <button onClick={createStaffLogin} disabled={creating} className="bg-orange-600 text-white px-4 py-2 rounded font-bold disabled:opacity-50">
+                            {creating ? 'Banaya ja raha hai...' : 'Staff Login Banayein'}
+                        </button>
+                    </div>
+
                     <p className="text-sm text-gray-500 mb-4 max-w-2xl">
-                        Naya staff member sirf Google se login karke <strong>"Access Request Bhejein"</strong> dabayega —
-                        uska request neeche "Pending Approvals" me apne aap aa jayega, koi code share karne ki zaroorat nahi.
+                        Isके alawa koi Google se login karke <strong>"Access Request Bhejein"</strong> bhi kar sakta hai —
+                        uska request neeche "Pending Approvals" me aayega.
                     </p>
 
                     {pending.length > 0 && (
@@ -1173,7 +1426,8 @@
                                         <div className="flex justify-between items-center">
                                             <div>
                                                 <span className="font-bold">{u.name}</span> <span className="text-xs bg-gray-200 px-1 rounded">{u.role}</span>
-                                                <div className="text-xs text-gray-500">{u.email}</div>
+                                                {isStaffLogin(u) && <span className="text-xs bg-orange-100 text-orange-700 px-1 rounded ml-1">Username Login</span>}
+                                                <div className="text-xs text-gray-500">{isStaffLogin(u) ? 'Username: ' + u.email.replace(STAFF_EMAIL_DOMAIN, '') : u.email}</div>
                                             </div>
                                             {u.role !== 'owner' && (
                                                 <div className="flex gap-2 items-center">
@@ -1682,7 +1936,12 @@
                             <tbody>${data.cart.map(i => `<tr><td>${i.name}</td><td style="text-align:right">${i.qty}</td><td style="text-align:right">${i.total}</td></tr>`).join('')}</tbody>
                         </table>
                         <hr style="border-top: 1px dashed #000; margin: 5px 0;">
-                        <div style="text-align:right; font-weight:bold; font-size:14px;">Total: ₹${data.grandTotal}</div>
+                        ${data.gstAmount > 0 ? `
+                        <div style="display:flex; justify-content:space-between; font-size:10px;"><span>Subtotal</span><span>₹${(data.subtotal || 0).toFixed(2)}</span></div>
+                        <div style="display:flex; justify-content:space-between; font-size:10px;"><span>CGST</span><span>₹${(data.gstAmount / 2).toFixed(2)}</span></div>
+                        <div style="display:flex; justify-content:space-between; font-size:10px;"><span>SGST</span><span>₹${(data.gstAmount / 2).toFixed(2)}</span></div>
+                        ` : ''}
+                        <div style="text-align:right; font-weight:bold; font-size:14px;">Total: ₹${(data.grandTotal || 0).toFixed(2)}</div>
                         ${data.paymentMode === 'Udhar' ? '<div style="text-align:center; font-weight:bold; font-size:12px; border:1px dashed #000; padding:3px; margin-top:4px;">** UDHAR - PAYMENT PENDING **</div>' : ''}
                         <center style="margin-top:10px; font-size:10px;">** Thank You Visit Again **</center>
                     </div>`;
@@ -1723,7 +1982,11 @@
                         </tbody>
                     </table>
                     <div style="margin-top:20px; text-align:right;">
-                        <h3 style="margin:0;">Grand Total: ₹${data.grandTotal}</h3>
+                        ${data.gstAmount > 0 ? `
+                        <p style="margin:2px 0;">Subtotal: ₹${(data.subtotal || 0).toFixed(2)}</p>
+                        <p style="margin:2px 0;">CGST: ₹${(data.gstAmount / 2).toFixed(2)} &nbsp; SGST: ₹${(data.gstAmount / 2).toFixed(2)}</p>
+                        ` : ''}
+                        <h3 style="margin:4px 0 0;">Grand Total: ₹${(data.grandTotal || 0).toFixed(2)}</h3>
                     </div>
                     <div style="margin-top:50px; display:flex; justify-content:space-between;">
                         <div style="border-top:1px solid #000; padding-top:5px;">Customer Signature</div>
