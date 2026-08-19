@@ -17,6 +17,11 @@
     <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-firestore-compat.js"></script>
     <script src="https://www.gstatic.com/firebasejs/10.13.0/firebase-analytics-compat.js"></script>
 
+    <!-- Excel/CSV import + PDF export -->
+    <script src="https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+    <script src="https://unpkg.com/jspdf@2.5.1/dist/jspdf.umd.min.js"></script>
+    <script src="https://unpkg.com/jspdf-autotable@3.8.2/dist/jspdf.plugin.autotable.js"></script>
+
     <style>
         @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap');
         body { font-family: 'Inter', sans-serif; background: #f3f4f6; }
@@ -440,12 +445,23 @@
         // 4. DASHBOARD
         // ============================================================
         const Dashboard = ({ sales, products, lang }) => {
+            const [filter, setFilter] = useState({ from: '', to: '' });
+            const [notifPermission, setNotifPermission] = useState(typeof Notification !== 'undefined' ? Notification.permission : 'unsupported');
+
             const stats = useMemo(() => {
-                const totalSales = sales.reduce((sum, s) => sum + (s.grandTotal || 0), 0);
-                const totalProfit = sales.reduce((sum, s) => sum + (s.totalProfit || 0), 0);
+                const activeSales = sales.filter(s => {
+                    if (s.voided) return false;
+                    const d = (s.date || '').split('T')[0];
+                    if (filter.from && d < filter.from) return false;
+                    if (filter.to && d > filter.to) return false;
+                    return true;
+                });
+
+                const totalSales = activeSales.reduce((sum, s) => sum + (s.grandTotal || 0) - (s.returnedTotal || 0), 0);
+                const totalProfit = activeSales.reduce((sum, s) => sum + (s.totalProfit || 0) - (s.returnedProfit || 0), 0);
                 const lowStockItems = products.filter(p => p.stock < 10).sort((a, b) => a.stock - b.stock);
                 const prodMap = {};
-                sales.forEach(s => (s.cart || []).forEach(c => { prodMap[c.name] = (prodMap[c.name] || 0) + c.qty; }));
+                activeSales.forEach(s => (s.cart || []).forEach(c => { prodMap[c.name] = (prodMap[c.name] || 0) + c.qty; }));
                 const hero = Object.entries(prodMap).sort((a, b) => b[1] - a[1])[0];
 
                 // Category-wise breakdown: stock value, low stock count, units sold, revenue, hero product
@@ -457,7 +473,7 @@
                     c.stockValue += (p.priceBuy || 0) * p.stock;
                     if (p.stock < 10) c.lowStock++;
                 });
-                sales.forEach(s => (s.cart || []).forEach(item => {
+                activeSales.forEach(s => (s.cart || []).forEach(item => {
                     const c = ensure(item.category || 'Other');
                     c.unitsSold += item.qty;
                     c.revenue += item.total;
@@ -468,15 +484,45 @@
                     return { category: cat, items: d.items, stockValue: d.stockValue, lowStock: d.lowStock, unitsSold: d.unitsSold, revenue: d.revenue, hero: heroSorted[0] ? heroSorted[0][0] : '—' };
                 }).sort((a, b) => b.revenue - a.revenue);
 
-                return { totalSales, totalProfit, lowStockItems, hero: hero ? hero[0] : 'None', categoryStats };
-            }, [sales, products]);
+                return { totalSales, totalProfit, lowStockItems, hero: hero ? hero[0] : 'None', categoryStats, billCount: activeSales.length };
+            }, [sales, products, filter]);
+
+            // Fire a single browser notification per page-load if permission is
+            // already granted and something is low in stock (opt-in via the button below).
+            useEffect(() => {
+                if (notifPermission === 'granted' && stats.lowStockItems.length > 0) {
+                    try {
+                        new Notification('BuildMart POS — Low Stock Alert', {
+                            body: `${stats.lowStockItems.length} items kam stock me hain: ${stats.lowStockItems.slice(0, 3).map(p => p.name).join(', ')}${stats.lowStockItems.length > 3 ? '...' : ''}`
+                        });
+                    } catch (e) { /* some browsers block this silently, ignore */ }
+                }
+                // eslint-disable-next-line react-hooks/exhaustive-deps
+            }, []); // only once per Dashboard mount, not on every stats recalculation
+
+            const enableNotifications = () => {
+                if (typeof Notification === 'undefined') return alert('Ye browser notifications support nahi karta.');
+                Notification.requestPermission().then(p => setNotifPermission(p));
+            };
 
             return (
                 <div className="p-6 overflow-auto">
-                    <h2 className="text-2xl font-bold mb-6">Business Overview</h2>
+                    <div className="flex flex-wrap justify-between items-end gap-4 mb-6">
+                        <h2 className="text-2xl font-bold">Business Overview</h2>
+                        <div className="flex gap-2 items-end">
+                            {notifPermission !== 'granted' && notifPermission !== 'unsupported' && (
+                                <button onClick={enableNotifications} className="text-xs bg-yellow-100 text-yellow-800 px-3 py-2 rounded font-bold self-center">🔔 Low Stock Alerts On Karo</button>
+                            )}
+                            <div className="flex gap-2 items-end bg-white p-2 rounded shadow">
+                                <div><label className="text-xs font-bold block text-gray-500">From</label><input type="date" className="border p-1 rounded text-sm" value={filter.from} onChange={e => setFilter({ ...filter, from: e.target.value })} /></div>
+                                <div><label className="text-xs font-bold block text-gray-500">To</label><input type="date" className="border p-1 rounded text-sm" value={filter.to} onChange={e => setFilter({ ...filter, to: e.target.value })} /></div>
+                                {(filter.from || filter.to) && <button onClick={() => setFilter({ from: '', to: '' })} className="text-xs bg-gray-100 px-2 py-1 rounded">Clear</button>}
+                            </div>
+                        </div>
+                    </div>
                     <div className="grid grid-cols-1 md:grid-cols-4 gap-4 mb-6">
                         <div className="bg-white p-4 rounded shadow border-l-4 border-blue-500">
-                            <p className="text-gray-500">Total Revenue</p>
+                            <p className="text-gray-500">Total Revenue ({stats.billCount} bills)</p>
                             <h3 className="text-2xl font-bold">₹{stats.totalSales.toLocaleString()}</h3>
                         </div>
                         <div className="bg-white p-4 rounded shadow border-l-4 border-green-500">
@@ -540,7 +586,7 @@
         // 5. INVENTORY (Firestore-backed)
         // ============================================================
         const Inventory = ({ orgId, products, isAdmin, lang }) => {
-            const [form, setForm] = useState({ name: '', category: 'Hardware', unit: 'Pcs', priceBuy: '', priceSell: '', stock: '', gst: 18, discount: 0, brand: '', spec: '' });
+            const [form, setForm] = useState({ name: '', category: 'Hardware', unit: 'Pcs', priceBuy: '', priceSell: '', stock: '', gst: 18, discount: 0, brand: '', spec: '', barcode: '' });
             const [search, setSearch] = useState('');
             const [suggestions, setSuggestions] = useState([]);
             const [restockProd, setRestockProd] = useState(null); // set when an existing product is picked
@@ -548,13 +594,16 @@
             const [purchaseMode, setPurchaseMode] = useState('Cash'); // Cash | Udhar (admin only, tracks supplier khata)
             const [purchaseGstIncluded, setPurchaseGstIncluded] = useState(false); // is GST already included in Purchase Rate?
             const [quickBase, setQuickBase] = useState(''); // base item picked from catalog, e.g. "TMT Steel Bar"
+            const [importBusy, setImportBusy] = useState(false);
+            const [importMsg, setImportMsg] = useState('');
             const nameRef = useRef();
+            const importFileRef = useRef();
 
             const productsRef = db.collection('orgs').doc(orgId).collection('products');
             const catalogEntry = CATALOG[form.category];
 
             const resetForm = () => {
-                setForm({ name: '', category: 'Hardware', unit: 'Pcs', priceBuy: '', priceSell: '', stock: '', gst: 18, discount: 0, brand: '', spec: '' });
+                setForm({ name: '', category: 'Hardware', unit: 'Pcs', priceBuy: '', priceSell: '', stock: '', gst: 18, discount: 0, brand: '', spec: '', barcode: '' });
                 setRestockProd(null);
                 setSuggestions([]);
                 setSupplier({ name: '', mobile: '' });
@@ -600,7 +649,7 @@
                     name: p.name, category: p.category, unit: p.unit,
                     priceBuy: p.priceBuy, priceSell: p.priceSell,
                     stock: '', gst: p.gst, discount: p.discount,
-                    brand: p.brand || '', spec: p.spec || ''
+                    brand: p.brand || '', spec: p.spec || '', barcode: p.barcode || ''
                 });
                 setRestockProd(p);
                 setSuggestions([]);
@@ -635,14 +684,14 @@
 
                 if (restockProd) {
                     batch.update(productRef, {
-                        category: form.category, unit: form.unit, brand: form.brand || '', spec: form.spec || '',
+                        category: form.category, unit: form.unit, brand: form.brand || '', spec: form.spec || '', barcode: form.barcode || '',
                         priceBuy: buyRate, priceSell: Number(form.priceSell),
                         gst: gstPct, discount: Number(form.discount) || 0,
                         stock: FieldValue.increment(stockQty)
                     });
                 } else {
                     batch.set(productRef, {
-                        name: form.name, category: form.category, unit: form.unit, brand: form.brand || '', spec: form.spec || '',
+                        name: form.name, category: form.category, unit: form.unit, brand: form.brand || '', spec: form.spec || '', barcode: form.barcode || '',
                         priceBuy: buyRate, priceSell: Number(form.priceSell),
                         stock: stockQty, gst: gstPct, discount: Number(form.discount) || 0,
                         createdAt: FieldValue.serverTimestamp()
@@ -673,7 +722,78 @@
                 if (confirm('Delete product?')) await productsRef.doc(id).delete();
             };
 
-            const filtered = products.filter(p => p.name.toLowerCase().includes(search.toLowerCase()) || p.category.toLowerCase().includes(search.toLowerCase()) || (p.brand || '').toLowerCase().includes(search.toLowerCase()));
+            const downloadImportTemplate = () => {
+                const headers = ['Name', 'Category', 'Unit', 'Brand', 'Spec', 'PriceBuy', 'PriceSell', 'Stock', 'GST', 'Discount', 'Barcode'];
+                const sample = ['UltraTech Cement', 'Cement', 'Bags', 'UltraTech', '50kg Bag', 320, 380, 100, 28, 0, ''];
+                const csv = headers.join(',') + '\n' + sample.join(',') + '\n';
+                const blob = new Blob([csv], { type: 'text/csv' });
+                const url = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url; a.download = 'inventory_import_template.csv'; a.click();
+            };
+
+            const handleImportFile = async (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+                setImportBusy(true); setImportMsg('');
+                try {
+                    const data = await file.arrayBuffer();
+                    const workbook = XLSX.read(data, { type: 'array' });
+                    const sheet = workbook.Sheets[workbook.SheetNames[0]];
+                    const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+
+                    // Column names are matched case-insensitively so "price sell",
+                    // "PriceSell", "Sell Rate" style headers all still work.
+                    const getCol = (row, ...names) => {
+                        for (const key of Object.keys(row)) {
+                            const norm = key.toLowerCase().replace(/[\s_]/g, '');
+                            if (names.some(n => norm === n.toLowerCase().replace(/[\s_]/g, ''))) return row[key];
+                        }
+                        return '';
+                    };
+
+                    let imported = 0, skipped = 0;
+                    const chunks = [];
+                    let currentChunk = [];
+                    rows.forEach(row => {
+                        const name = String(getCol(row, 'name', 'productname', 'item') || '').trim();
+                        const priceSell = Number(getCol(row, 'pricesell', 'sellrate', 'sellprice', 'rate'));
+                        if (!name || !priceSell) { skipped++; return; }
+                        const category = String(getCol(row, 'category') || 'Other').trim() || 'Other';
+                        currentChunk.push({
+                            name, category: CATEGORIES.includes(category) ? category : 'Other',
+                            unit: String(getCol(row, 'unit') || 'Pcs').trim() || 'Pcs',
+                            brand: String(getCol(row, 'brand', 'company') || '').trim(),
+                            spec: String(getCol(row, 'spec', 'size', 'type') || '').trim(),
+                            priceBuy: Number(getCol(row, 'pricebuy', 'purchaserate', 'costprice')) || 0,
+                            priceSell,
+                            stock: Number(getCol(row, 'stock', 'qty', 'quantity')) || 0,
+                            gst: Number(getCol(row, 'gst', 'tax')) || 0,
+                            discount: Number(getCol(row, 'discount', 'disc')) || 0,
+                            barcode: String(getCol(row, 'barcode', 'ean', 'sku') || '').trim(),
+                            createdAt: FieldValue.serverTimestamp()
+                        });
+                        imported++;
+                        if (currentChunk.length === 400) { chunks.push(currentChunk); currentChunk = []; }
+                    });
+                    if (currentChunk.length) chunks.push(currentChunk);
+
+                    for (const chunk of chunks) {
+                        const batch = db.batch();
+                        chunk.forEach(p => batch.set(productsRef.doc(), p));
+                        await batch.commit();
+                    }
+
+                    setImportMsg(`✓ ${imported} products imported${skipped ? `, ${skipped} rows skipped (missing name/price)` : ''}.`);
+                } catch (err) {
+                    setImportMsg('Error: ' + err.message);
+                } finally {
+                    setImportBusy(false);
+                    if (importFileRef.current) importFileRef.current.value = '';
+                }
+            };
+
+            const filtered = products.filter(p => p.name.toLowerCase().includes(search.toLowerCase()) || p.category.toLowerCase().includes(search.toLowerCase()) || (p.brand || '').toLowerCase().includes(search.toLowerCase()) || (p.barcode || '').includes(search));
 
             return (
                 <div className="p-4 h-full overflow-auto">
@@ -755,6 +875,7 @@
                                 <input type="number" placeholder={t(lang, 'inv_gst')} className="border p-2 rounded w-1/2" value={form.gst} onChange={e => setForm({ ...form, gst: e.target.value })} />
                                 <input type="number" placeholder={t(lang, 'inv_disc')} className="border p-2 rounded w-1/2" value={form.discount} onChange={e => setForm({ ...form, discount: e.target.value })} />
                             </div>
+                            <input placeholder="Barcode (optional, scan karo)" className="border p-2 rounded" value={form.barcode} onChange={e => setForm({ ...form, barcode: e.target.value })} />
                             <button type="submit" className={`p-2 rounded text-white font-bold ${restockProd ? 'bg-blue-600 hover:bg-blue-700' : 'bg-green-600 hover:bg-green-700'}`}>
                                 {restockProd ? t(lang, 'inv_addStockBtn') : t(lang, 'inv_addBtn')}
                             </button>
@@ -805,10 +926,23 @@
                         )}
                     </div>
 
+                    {isAdmin && (
+                        <div className="bg-white p-4 rounded shadow mb-6 border-l-4 border-purple-500">
+                            <h3 className="font-bold mb-2">Bulk Import (Excel/CSV se ek saath sab items daalo)</h3>
+                            <p className="text-xs text-gray-500 mb-3">Columns: Name, Category, Unit, Brand, Spec, PriceBuy, PriceSell, Stock, GST, Discount, Barcode. Pehle template download karke usी format me bharo.</p>
+                            <div className="flex flex-wrap gap-2 items-center">
+                                <button onClick={downloadImportTemplate} className="bg-gray-100 text-gray-700 px-3 py-2 rounded text-sm font-bold">Template Download Karo</button>
+                                <input ref={importFileRef} type="file" accept=".xlsx,.xls,.csv" onChange={handleImportFile} className="text-sm" />
+                                {importBusy && <span className="text-sm text-gray-500">Import ho raha hai...</span>}
+                            </div>
+                            {importMsg && <p className={`text-sm mt-2 font-bold ${importMsg.startsWith('Error') ? 'text-red-600' : 'text-green-600'}`}>{importMsg}</p>}
+                        </div>
+                    )}
+
                     <div className="bg-white rounded shadow overflow-hidden">
                         <div className="p-3 bg-gray-50 border-b flex justify-between">
                             <h3 className="font-bold">{t(lang, 'inv_list')} ({products.length})</h3>
-                            <input placeholder={t(lang, 'inv_search')} className="border p-1 rounded" value={search} onChange={e => setSearch(e.target.value)} />
+                            <input placeholder={t(lang, 'inv_search') + ' (ya barcode scan)'} className="border p-1 rounded" value={search} onChange={e => setSearch(e.target.value)} />
                         </div>
                         <table className="w-full text-sm text-left">
                             <thead className="bg-gray-100">
@@ -854,7 +988,8 @@
             const [qtyInput, setQtyInput] = useState('');
             const [discInput, setDiscInput] = useState('');
             const [billType, setBillType] = useState('Estimate');
-            const [paymentMode, setPaymentMode] = useState('Cash'); // Cash | Udhar
+            const [paymentMode, setPaymentMode] = useState('Cash'); // Cash | Udhar | Split
+            const [splitCash, setSplitCash] = useState('');
             const [customer, setCustomer] = useState({ name: '', mobile: '', gst: '', address: '' });
             const [saving, setSaving] = useState(false);
 
@@ -874,11 +1009,32 @@
             // Always show a browsable list: filter by typed search AND/OR selected category chip.
             // (Previously nothing showed until you typed — now staff can browse type-wise too.)
             const filteredProducts = products
-                .filter(p => !query || p.name.toLowerCase().includes(query.toLowerCase()) || (p.brand || '').toLowerCase().includes(query.toLowerCase()))
+                .filter(p => !query || p.name.toLowerCase().includes(query.toLowerCase()) || (p.brand || '').toLowerCase().includes(query.toLowerCase()) || (p.barcode || '') === query.trim())
                 .filter(p => catFilter === 'All' || p.category === catFilter)
                 .sort((a, b) => a.category === b.category ? a.name.localeCompare(b.name) : a.category.localeCompare(b.category));
 
             const categoriesInStock = ['All', ...CATEGORIES.filter(c => products.some(p => p.category === c))];
+
+            // Barcode scanners behave like a keyboard that types the code then hits
+            // Enter almost instantly. If the typed text exactly matches a barcode,
+            // add it straight to the cart (qty 1) instead of waiting for a click.
+            const handleSearchKeyDown = (e) => {
+                if (e.key !== 'Enter') return;
+                const q = query.trim();
+                if (!q) return;
+                const byBarcode = products.find(p => p.barcode && p.barcode === q);
+                const exactName = !byBarcode && products.find(p => p.name.toLowerCase() === q.toLowerCase());
+                const match = byBarcode || exactName;
+                if (match) {
+                    e.preventDefault();
+                    if (match.stock < 1) { alert(`Stock khatam hai: ${match.name}`); return; }
+                    const disc = match.discount || 0;
+                    const finalPrice = match.priceSell - (match.priceSell * (disc / 100));
+                    const newItem = { ...match, qty: 1, discount: disc, finalPrice, total: finalPrice, profit: (finalPrice - match.priceBuy) * 1 };
+                    setCart(prev => [...prev, newItem]);
+                    setQuery('');
+                }
+            };
 
             const addToCart = (e) => {
                 e.preventDefault();
@@ -908,27 +1064,39 @@
 
             const completeSale = async (shouldPrint) => {
                 if (cart.length === 0) return alert('Cart Empty!');
-                if (paymentMode === 'Udhar' && !customer.name.trim()) { alert('Udhar ke liye Customer Name daalna zaroori hai!'); return; }
+                const provisionalTotal = cart.reduce((s, i) => s + i.total, 0) + (billType === 'Tax Invoice' ? cart.reduce((s, i) => s + i.total * ((i.gst || 0) / 100), 0) : 0);
+                let udharPortion = 0;
+                if (paymentMode === 'Udhar') udharPortion = provisionalTotal;
+                else if (paymentMode === 'Split') {
+                    udharPortion = Math.max(0, provisionalTotal - (Number(splitCash) || 0));
+                    if ((Number(splitCash) || 0) > provisionalTotal) { alert('Cash amount total se zyada nahi ho sakta.'); return; }
+                }
+                if (udharPortion > 0 && !customer.name.trim()) { alert('Udhar ke liye Customer Name daalna zaroori hai!'); return; }
                 if (saving) return;
                 setSaving(true);
                 try {
                     const subtotal = cart.reduce((sum, item) => sum + item.total, 0);
                     const gstAmount = billType === 'Tax Invoice' ? cart.reduce((sum, item) => sum + item.total * ((item.gst || 0) / 100), 0) : 0;
                     const grandTotal = subtotal + gstAmount;
+                    const cashAmount = grandTotal - udharPortion;
                     const totalProfit = cart.reduce((sum, item) => sum + (item.profit || 0), 0);
                     const saleData = {
                         date: new Date().toISOString(),
                         createdAt: FieldValue.serverTimestamp(),
                         customer, cart, subtotal, gstAmount, grandTotal, totalProfit, billType, paymentMode,
+                        cashAmount, udharAmount: udharPortion,
+                        voided: false,
+                        returnedTotal: 0, returnedProfit: 0,
                         printed: shouldPrint,
                         staffUid: firebaseUser.uid,
                         staffName: userDoc.name,
                         staffEmail: userDoc.email
                     };
 
-                    // If Udhar (credit) sale, find-or-create the customer's khata party
+                    // If any part of this sale is on credit (Udhar or the udhar-half of
+                    // a Split payment), find-or-create the customer's khata party.
                     let partyRef = null;
-                    if (paymentMode === 'Udhar') {
+                    if (udharPortion > 0) {
                         const partiesRef = db.collection('orgs').doc(orgId).collection('parties');
                         let existing = null;
                         if (customer.mobile) {
@@ -949,12 +1117,12 @@
                     if (partyRef) {
                         batch.set(partyRef, {
                             name: customer.name, mobile: customer.mobile || '', type: 'customer',
-                            balance: FieldValue.increment(grandTotal),
+                            balance: FieldValue.increment(udharPortion),
                             createdAt: FieldValue.serverTimestamp()
                         }, { merge: true });
                         const txnRef = partyRef.collection('transactions').doc();
                         batch.set(txnRef, {
-                            type: 'sale_credit', amount: grandTotal, note: `Bill #${saleRef.id.slice(-6)}`,
+                            type: 'sale_credit', amount: udharPortion, note: `Bill #${saleRef.id.slice(-6)}${paymentMode === 'Split' ? ' (part payment)' : ''}`,
                             billId: saleRef.id, date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp(),
                             staffUid: firebaseUser.uid, staffName: userDoc.name
                         });
@@ -969,7 +1137,7 @@
                         window.print();
                     }
 
-                    setCart([]); setCustomer({ name: '', mobile: '', gst: '', address: '' }); setQuery(''); setPaymentMode('Cash');
+                    setCart([]); setCustomer({ name: '', mobile: '', gst: '', address: '' }); setQuery(''); setPaymentMode('Cash'); setSplitCash('');
                 } catch (e) {
                     alert('Error: ' + e.message);
                 } finally {
@@ -987,7 +1155,7 @@
                 <div className="flex h-full gap-4 p-4">
                     <div className="w-2/3 bg-white rounded shadow p-4 flex flex-col">
                         <div className="flex gap-2 mb-3">
-                            <input ref={searchRef} className="flex-1 border-2 border-blue-500 rounded p-3 text-lg" placeholder="F2: Search Product (Cement, Pipe...)" value={query} onChange={e => setQuery(e.target.value)} />
+                            <input ref={searchRef} className="flex-1 border-2 border-blue-500 rounded p-3 text-lg" placeholder="F2: Search or Scan Barcode" value={query} onChange={e => setQuery(e.target.value)} onKeyDown={handleSearchKeyDown} />
                         </div>
                         <div className="flex flex-wrap gap-1 mb-3">
                             {categoriesInStock.map(c => (
@@ -1017,20 +1185,28 @@
                     <div className="w-1/3 bg-gray-50 rounded shadow flex flex-col border-l">
                         <div className="p-3 bg-slate-800 text-white rounded-t flex justify-between items-center">
                             <h2 className="font-bold">Billing Details</h2>
-                            {paymentMode === 'Udhar' && <span className="text-xs bg-red-500 px-2 py-1 rounded font-bold">UDHAR</span>}
+                            {paymentMode !== 'Cash' && <span className="text-xs bg-red-500 px-2 py-1 rounded font-bold">{paymentMode === 'Split' ? 'PART UDHAR' : 'UDHAR'}</span>}
                         </div>
                         <div className="p-3 space-y-2 bg-white">
                             <div className="flex gap-2">
                                 <select className="border p-1 rounded text-sm font-bold bg-yellow-100" value={billType} onChange={e => setBillType(e.target.value)}>
                                     <option>Estimate</option><option>Tax Invoice</option>
                                 </select>
-                                <select className={`border p-1 rounded text-sm font-bold ${paymentMode === 'Udhar' ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}`} value={paymentMode} onChange={e => setPaymentMode(e.target.value)}>
+                                <select className={`border p-1 rounded text-sm font-bold ${paymentMode === 'Cash' ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`} value={paymentMode} onChange={e => setPaymentMode(e.target.value)}>
                                     <option value="Cash">Cash</option>
                                     <option value="Udhar">Udhar (Credit)</option>
+                                    <option value="Split">Split (Cash + Udhar)</option>
                                 </select>
                             </div>
-                            <input className="border p-1 rounded w-full text-sm" placeholder={paymentMode === 'Udhar' ? 'Customer Name (zaroori)' : 'Customer Name'} value={customer.name} onChange={e => setCustomer({ ...customer, name: e.target.value })} />
-                            {(paymentMode === 'Udhar' || billType === 'Tax Invoice') && (
+                            {paymentMode === 'Split' && (
+                                <div className="bg-yellow-50 border border-yellow-200 rounded p-2">
+                                    <label className="text-xs font-bold text-gray-600 block mb-1">Cash Amount Kitna Mila?</label>
+                                    <input type="number" min="0" max={totals.grandTotal} className="border p-1 rounded w-full text-sm" placeholder="Cash Amount ₹" value={splitCash} onChange={e => setSplitCash(e.target.value)} />
+                                    <p className="text-xs text-red-600 mt-1">Baki ₹{Math.max(0, totals.grandTotal - (Number(splitCash) || 0)).toFixed(2)} Udhar me jayega.</p>
+                                </div>
+                            )}
+                            <input className="border p-1 rounded w-full text-sm" placeholder={paymentMode !== 'Cash' ? 'Customer Name (zaroori)' : 'Customer Name'} value={customer.name} onChange={e => setCustomer({ ...customer, name: e.target.value })} />
+                            {(paymentMode !== 'Cash' || billType === 'Tax Invoice') && (
                                 <div className="flex gap-1">
                                     {billType === 'Tax Invoice' && <input className="border p-1 rounded text-sm w-2/3" placeholder="GSTIN" value={customer.gst} onChange={e => setCustomer({ ...customer, gst: e.target.value })} onBlur={fetchGST} />}
                                     <input className={`border p-1 rounded text-sm ${billType === 'Tax Invoice' ? 'w-1/3' : 'w-full'}`} placeholder="Mobile" value={customer.mobile} onChange={e => setCustomer({ ...customer, mobile: e.target.value })} />
@@ -1073,8 +1249,8 @@
                                 <button onClick={() => completeSale(false)} disabled={saving} className="w-full bg-slate-700 hover:bg-slate-800 text-white py-3 rounded font-bold shadow disabled:opacity-50">
                                     {saving ? 'Saving...' : 'Save Only (F8)'}
                                 </button>
-                                <button onClick={() => completeSale(true)} disabled={saving} className={`w-full text-white py-3 rounded font-bold shadow disabled:opacity-50 ${paymentMode === 'Udhar' ? 'bg-red-600 hover:bg-red-700' : 'bg-green-600 hover:bg-green-700'}`}>
-                                    {saving ? 'Saving...' : (paymentMode === 'Udhar' ? 'Save as Udhar (F9)' : 'Print & Save (F9)')}
+                                <button onClick={() => completeSale(true)} disabled={saving} className={`w-full text-white py-3 rounded font-bold shadow disabled:opacity-50 ${paymentMode !== 'Cash' ? 'bg-red-600 hover:bg-red-700' : 'bg-green-600 hover:bg-green-700'}`}>
+                                    {saving ? 'Saving...' : (paymentMode !== 'Cash' ? 'Save with Udhar (F9)' : 'Print & Save (F9)')}
                                 </button>
                             </div>
                             <p className="text-xs text-gray-400 text-center mt-2">"Save Only" se bill data hamesha save hota hai — print karna zaroori nahi hai.</p>
@@ -1109,9 +1285,12 @@
         // ============================================================
         // 7. SALES REPORTS
         // ============================================================
-        const SalesReport = ({ sales, userDoc }) => {
+        const SalesReport = ({ orgId, sales, userDoc }) => {
             const [filter, setFilter] = useState({ from: '', to: '' });
             const [searchTerm, setSearchTerm] = useState('');
+            const [returnSale, setReturnSale] = useState(null);
+            const [returnQtys, setReturnQtys] = useState({});
+            const [busy, setBusy] = useState(false);
             const isAdmin = userDoc.role === 'owner' || userDoc.role === 'admin';
 
             const filteredSales = sales.filter(s => {
@@ -1123,12 +1302,30 @@
             }).slice().reverse();
 
             const downloadExcel = () => {
-                let csv = 'ID,Date,Customer,Staff,Bill Type,Payment,Amount\n';
-                filteredSales.forEach(s => { csv += `${s.id},${new Date(s.date).toLocaleDateString()},${s.customer.name},${s.staffName},${s.billType},${s.paymentMode || 'Cash'},${s.grandTotal}\n`; });
+                let csv = 'ID,Date,Customer,Staff,Bill Type,Payment,Status,Amount,Returned\n';
+                filteredSales.forEach(s => { csv += `${s.id},${new Date(s.date).toLocaleDateString()},${s.customer.name},${s.staffName},${s.billType},${s.paymentMode || 'Cash'},${s.voided ? 'VOID' : 'OK'},${s.grandTotal},${s.returnedTotal || 0}\n`; });
                 const blob = new Blob([csv], { type: 'text/csv' });
                 const url = window.URL.createObjectURL(blob);
                 const a = document.createElement('a');
                 a.href = url; a.download = `Sales_Report_${new Date().toISOString().slice(0, 10)}.csv`; a.click();
+            };
+
+            const downloadPDF = () => {
+                const doc = new window.jspdf.jsPDF();
+                doc.setFontSize(14);
+                doc.text('Sales Report', 14, 15);
+                doc.setFontSize(9);
+                doc.text(`${filter.from || 'Start'} to ${filter.to || 'Today'}`, 14, 21);
+                doc.autoTable({
+                    startY: 26,
+                    head: [['Bill ID', 'Date', 'Customer', 'Type', 'Payment', 'Staff', 'Amount']],
+                    body: filteredSales.map(s => [
+                        s.id.toString().slice(-8), new Date(s.date).toLocaleDateString(), s.customer.name || 'Walk-in',
+                        s.billType, s.paymentMode || 'Cash', s.staffName, (s.voided ? 'VOID ' : '') + '₹' + s.grandTotal.toFixed(2)
+                    ]),
+                    styles: { fontSize: 8 }
+                });
+                doc.save(`Sales_Report_${new Date().toISOString().slice(0, 10)}.pdf`);
             };
 
             // Staff-wise summary: who sold how much, and how much cash they should
@@ -1136,16 +1333,108 @@
             const staffSummary = useMemo(() => {
                 if (!isAdmin) return [];
                 const map = {};
-                filteredSales.forEach(s => {
+                filteredSales.filter(s => !s.voided).forEach(s => {
                     const key = s.staffUid || 'unknown';
                     if (!map[key]) map[key] = { staffName: s.staffName || 'Unknown', bills: 0, cashTotal: 0, udharTotal: 0, grandTotal: 0 };
+                    const net = (s.grandTotal || 0) - (s.returnedTotal || 0);
                     map[key].bills++;
-                    map[key].grandTotal += s.grandTotal || 0;
-                    if (s.paymentMode === 'Udhar') map[key].udharTotal += s.grandTotal || 0;
-                    else map[key].cashTotal += s.grandTotal || 0;
+                    map[key].grandTotal += net;
+                    map[key].udharTotal += (s.udharAmount || 0);
+                    map[key].cashTotal += net - (s.udharAmount || 0);
                 });
                 return Object.values(map).sort((a, b) => b.grandTotal - a.grandTotal);
             }, [filteredSales, isAdmin]);
+
+            const voidSale = async (sale) => {
+                if (!confirm(`Bill #${sale.id.toString().slice(-6)} ko VOID (cancel) karna hai? Stock wapas add ho jayega.`)) return;
+                setBusy(true);
+                try {
+                    const batch = db.batch();
+                    (sale.cart || []).forEach(item => {
+                        const remaining = item.qty - (item.returnedQty || 0);
+                        if (remaining > 0) {
+                            batch.update(db.collection('orgs').doc(orgId).collection('products').doc(item.id), { stock: FieldValue.increment(remaining) });
+                        }
+                    });
+                    const remainingUdhar = Math.max(0, (sale.udharAmount || 0) - (sale.returnedTotal || 0));
+                    if (sale.partyId && remainingUdhar > 0) {
+                        const partyRef = db.collection('orgs').doc(orgId).collection('parties').doc(sale.partyId);
+                        batch.update(partyRef, { balance: FieldValue.increment(-remainingUdhar) });
+                        batch.set(partyRef.collection('transactions').doc(), {
+                            type: 'payment_received', amount: remainingUdhar, note: `Bill #${sale.id.toString().slice(-6)} voided`,
+                            date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp()
+                        });
+                    }
+                    batch.update(db.collection('orgs').doc(orgId).collection('sales').doc(sale.id), {
+                        voided: true, voidedAt: FieldValue.serverTimestamp(), voidedByName: userDoc.name
+                    });
+                    await batch.commit();
+                } catch (e) {
+                    alert('Error: ' + e.message);
+                } finally {
+                    setBusy(false);
+                }
+            };
+
+            const openReturn = (sale) => {
+                setReturnSale(sale);
+                setReturnQtys({});
+            };
+
+            const submitReturn = async () => {
+                const items = (returnSale.cart || []).map((item, idx) => ({ item, idx, qty: Number(returnQtys[idx]) || 0 }))
+                    .filter(x => x.qty > 0);
+                if (items.length === 0) { alert('Kam se kam ek item ki return quantity daalo.'); return; }
+                for (const x of items) {
+                    const remaining = x.item.qty - (x.item.returnedQty || 0);
+                    if (x.qty > remaining) { alert(`${x.item.name}: max ${remaining} hi return ho sakta hai.`); return; }
+                }
+                setBusy(true);
+                try {
+                    const totalReturnAmount = items.reduce((s, x) => s + x.item.finalPrice * x.qty, 0);
+                    const totalReturnProfit = items.reduce((s, x) => s + (x.item.finalPrice - x.item.priceBuy) * x.qty, 0);
+                    const newCart = returnSale.cart.map((item, idx) => {
+                        const match = items.find(x => x.idx === idx);
+                        return match ? { ...item, returnedQty: (item.returnedQty || 0) + match.qty } : item;
+                    });
+
+                    const batch = db.batch();
+                    items.forEach(x => {
+                        batch.update(db.collection('orgs').doc(orgId).collection('products').doc(x.item.id), { stock: FieldValue.increment(x.qty) });
+                    });
+                    batch.update(db.collection('orgs').doc(orgId).collection('sales').doc(returnSale.id), {
+                        cart: newCart,
+                        returnedTotal: FieldValue.increment(totalReturnAmount),
+                        returnedProfit: FieldValue.increment(totalReturnProfit)
+                    });
+
+                    const remainingUdhar = Math.max(0, (returnSale.udharAmount || 0) - (returnSale.returnedTotal || 0));
+                    const partyReduction = Math.min(totalReturnAmount, remainingUdhar);
+                    if (returnSale.partyId && partyReduction > 0) {
+                        const partyRef = db.collection('orgs').doc(orgId).collection('parties').doc(returnSale.partyId);
+                        batch.update(partyRef, { balance: FieldValue.increment(-partyReduction) });
+                        batch.set(partyRef.collection('transactions').doc(), {
+                            type: 'payment_received', amount: partyReduction, note: `Return against Bill #${returnSale.id.toString().slice(-6)}`,
+                            date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp()
+                        });
+                    }
+
+                    batch.set(db.collection('orgs').doc(orgId).collection('returns').doc(), {
+                        type: 'sale_return', saleId: returnSale.id,
+                        items: items.map(x => ({ productId: x.item.id, name: x.item.name, qty: x.qty, finalPrice: x.item.finalPrice, total: x.item.finalPrice * x.qty })),
+                        totalAmount: totalReturnAmount, date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp(),
+                        staffUid: userDoc.uid, staffName: userDoc.name
+                    });
+
+                    await batch.commit();
+                    setReturnSale(null);
+                    setReturnQtys({});
+                } catch (e) {
+                    alert('Error: ' + e.message);
+                } finally {
+                    setBusy(false);
+                }
+            };
 
             return (
                 <div className="p-6 overflow-auto">
@@ -1154,6 +1443,7 @@
                         <div><label className="text-xs font-bold block">To Date</label><input type="date" className="border p-2 rounded" value={filter.to} onChange={e => setFilter({ ...filter, to: e.target.value })} /></div>
                         <div className="flex-1"><label className="text-xs font-bold block">Search ID/Customer</label><input className="border p-2 rounded w-full" value={searchTerm} onChange={e => setSearchTerm(e.target.value)} placeholder="Name or Bill ID" /></div>
                         <button onClick={downloadExcel} className="bg-green-600 text-white p-2 rounded font-bold">Export Excel</button>
+                        <button onClick={downloadPDF} className="bg-red-600 text-white p-2 rounded font-bold">Download PDF</button>
                     </div>
 
                     {isAdmin && staffSummary.length > 0 && (
@@ -1175,29 +1465,77 @@
                                     ))}
                                 </tbody>
                             </table>
-                            <p className="text-xs text-gray-400 p-2">"Cash Sales" column jitna cash us staff ke paas physically hona chahiye (Udhar wale paise abhi collect nahi hue).</p>
+                            <p className="text-xs text-gray-400 p-2">Voided bills is summary me nahi ginte. "Cash Sales" me returns/refund adjust ho chuka hai.</p>
                         </div>
                     )}
 
                     <div className="bg-white rounded shadow overflow-hidden">
                         <table className="w-full text-sm">
-                            <thead className="bg-gray-100 border-b"><tr><th className="p-3 text-left">Bill ID</th><th className="p-3 text-left">Date</th><th className="p-3 text-left">Customer</th><th className="p-3 text-left">Type</th><th className="p-3 text-left">Payment</th><th className="p-3 text-left">Staff</th><th className="p-3 text-right">Amount</th></tr></thead>
+                            <thead className="bg-gray-100 border-b"><tr><th className="p-3 text-left">Bill ID</th><th className="p-3 text-left">Date</th><th className="p-3 text-left">Customer</th><th className="p-3 text-left">Type</th><th className="p-3 text-left">Payment</th><th className="p-3 text-left">Staff</th><th className="p-3 text-right">Amount</th>{isAdmin && <th className="p-3 text-center">Action</th>}</tr></thead>
                             <tbody>
                                 {filteredSales.map(s => (
-                                    <tr key={s.id} className="border-b hover:bg-gray-50">
+                                    <tr key={s.id} className={`border-b hover:bg-gray-50 ${s.voided ? 'opacity-50' : ''}`}>
                                         <td className="p-3 font-mono text-xs">{s.id.toString().slice(-8)}</td>
                                         <td className="p-3">{new Date(s.date).toLocaleString()}</td>
                                         <td className="p-3 font-bold">{s.customer.name || 'Walk-in'}</td>
                                         <td className="p-3"><span className={`px-2 py-1 rounded text-xs ${s.billType === 'Estimate' ? 'bg-yellow-100 text-yellow-800' : 'bg-blue-100 text-blue-800'}`}>{s.billType}</span></td>
-                                        <td className="p-3"><span className={`px-2 py-1 rounded text-xs ${s.paymentMode === 'Udhar' ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}`}>{s.paymentMode || 'Cash'}</span></td>
+                                        <td className="p-3"><span className={`px-2 py-1 rounded text-xs ${(s.paymentMode || 'Cash') !== 'Cash' ? 'bg-red-100 text-red-700' : 'bg-green-100 text-green-700'}`}>{s.paymentMode || 'Cash'}</span></td>
                                         <td className="p-3">{s.staffName}</td>
-                                        <td className="p-3 text-right font-bold">₹{s.grandTotal}</td>
+                                        <td className="p-3 text-right">
+                                            {s.voided && <span className="text-red-600 font-bold text-xs block">VOIDED</span>}
+                                            {!!s.returnedTotal && <span className="text-orange-600 text-xs block">Returned ₹{s.returnedTotal.toFixed(2)}</span>}
+                                            <span className="font-bold">₹{s.grandTotal}</span>
+                                        </td>
+                                        {isAdmin && (
+                                            <td className="p-3 text-center whitespace-nowrap">
+                                                {!s.voided && (
+                                                    <>
+                                                        <button disabled={busy} onClick={() => openReturn(s)} className="text-blue-600 text-xs border px-2 py-1 rounded mr-1">Return</button>
+                                                        <button disabled={busy} onClick={() => voidSale(s)} className="text-red-600 text-xs border px-2 py-1 rounded">Void</button>
+                                                    </>
+                                                )}
+                                            </td>
+                                        )}
                                     </tr>
                                 ))}
                             </tbody>
                         </table>
                         {filteredSales.length === 0 && <div className="p-4 text-center text-gray-500">No records found.</div>}
                     </div>
+
+                    {returnSale && (
+                        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+                            <div className="bg-white rounded shadow-xl w-full max-w-lg max-h-[90vh] flex flex-col">
+                                <div className="p-4 border-b flex justify-between items-center">
+                                    <h3 className="font-bold">Return — Bill #{returnSale.id.toString().slice(-6)}</h3>
+                                    <button onClick={() => setReturnSale(null)} className="text-gray-400 text-xl">&times;</button>
+                                </div>
+                                <div className="p-4 overflow-auto flex-1 space-y-3">
+                                    {(returnSale.cart || []).map((item, idx) => {
+                                        const remaining = item.qty - (item.returnedQty || 0);
+                                        return (
+                                            <div key={idx} className="flex justify-between items-center border-b pb-2">
+                                                <div>
+                                                    <div className="font-bold text-sm">{item.name}</div>
+                                                    <div className="text-xs text-gray-500">Sold: {item.qty} {item.unit} · Remaining returnable: {remaining}</div>
+                                                </div>
+                                                <input type="number" min="0" max={remaining} disabled={remaining <= 0}
+                                                    className="border p-1 rounded w-20 text-center"
+                                                    value={returnQtys[idx] || ''}
+                                                    onChange={e => setReturnQtys({ ...returnQtys, [idx]: e.target.value })} />
+                                            </div>
+                                        );
+                                    })}
+                                </div>
+                                <div className="p-4 border-t">
+                                    <button disabled={busy} onClick={submitReturn} className="w-full bg-blue-600 text-white p-3 rounded font-bold disabled:opacity-50">
+                                        {busy ? 'Processing...' : 'Return Confirm Karo'}
+                                    </button>
+                                    <p className="text-xs text-gray-400 mt-2">Stock wapas add hoga, aur agar udhar tha to customer ka khata us hisaab se adjust hoga.</p>
+                                </div>
+                            </div>
+                        </div>
+                    )}
                 </div>
             );
         };
@@ -1499,7 +1837,7 @@
         // ============================================================
         // 11. KHATA BOOK — Udhar diya (customers) / Udhar liya (suppliers)
         // ============================================================
-        const KhataBook = ({ orgId, userDoc, firebaseUser }) => {
+        const KhataBook = ({ orgId, userDoc, firebaseUser, products }) => {
             const [tab, setTab] = useState('customer'); // customer | supplier
             const [parties, setParties] = useState([]);
             const [search, setSearch] = useState('');
@@ -1509,6 +1847,11 @@
             const [payNote, setPayNote] = useState('');
             const [showNewParty, setShowNewParty] = useState(false);
             const [newParty, setNewParty] = useState({ name: '', mobile: '', opening: '' });
+            const [showReturn, setShowReturn] = useState(false);
+            const [returnProdQuery, setReturnProdQuery] = useState('');
+            const [returnProd, setReturnProd] = useState(null);
+            const [returnQty, setReturnQty] = useState('');
+            const [returnBusy, setReturnBusy] = useState(false);
 
             const partiesRef = db.collection('orgs').doc(orgId).collection('parties');
 
@@ -1569,7 +1912,38 @@
                 setShowNewParty(false);
             };
 
-            const txnLabel = { sale_credit: 'Udhar Diya', purchase_credit: 'Udhar Liya', payment_received: 'Payment Mila', payment_made: 'Payment Diya', opening_balance: 'Opening Balance' };
+            const submitPurchaseReturn = async () => {
+                if (!returnProd || !returnQty || Number(returnQty) <= 0) { alert('Product aur quantity chuno.'); return; }
+                const qty = Number(returnQty);
+                setReturnBusy(true);
+                try {
+                    const amount = (returnProd.priceBuy || 0) * qty;
+                    const batch = db.batch();
+                    batch.update(db.collection('orgs').doc(orgId).collection('products').doc(returnProd.id), { stock: FieldValue.increment(-qty) });
+                    batch.update(partiesRef.doc(openParty.id), { balance: FieldValue.increment(-amount) });
+                    batch.set(partiesRef.doc(openParty.id).collection('transactions').doc(), {
+                        type: 'purchase_return', amount, note: `Return: ${returnProd.name} x ${qty} ${returnProd.unit}`,
+                        date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp(),
+                        staffUid: firebaseUser.uid, staffName: userDoc.name
+                    });
+                    batch.set(db.collection('orgs').doc(orgId).collection('returns').doc(), {
+                        type: 'purchase_return', supplierPartyId: openParty.id,
+                        items: [{ productId: returnProd.id, name: returnProd.name, qty, rate: returnProd.priceBuy, total: amount }],
+                        totalAmount: amount, date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp(),
+                        staffUid: firebaseUser.uid, staffName: userDoc.name
+                    });
+                    await batch.commit();
+                    setShowReturn(false); setReturnProd(null); setReturnQty(''); setReturnProdQuery('');
+                } catch (e) {
+                    alert('Error: ' + e.message);
+                } finally {
+                    setReturnBusy(false);
+                }
+            };
+
+            const returnProdMatches = returnProdQuery.length > 1 ? products.filter(p => p.name.toLowerCase().includes(returnProdQuery.toLowerCase())).slice(0, 6) : [];
+
+            const txnLabel = { sale_credit: 'Udhar Diya', purchase_credit: 'Udhar Liya', payment_received: 'Payment Mila', payment_made: 'Payment Diya', opening_balance: 'Opening Balance', purchase_return: 'Maal Wapas (Return)' };
 
             return (
                 <div className="p-6 overflow-auto">
@@ -1598,7 +1972,7 @@
                     <div className="bg-white rounded shadow overflow-hidden">
                         {filtered.length === 0 && <div className="p-4 text-center text-gray-500">Koi record nahi hai.</div>}
                         {filtered.map(p => (
-                            <div key={p.id} onClick={() => setOpenParty(p)} className="flex justify-between items-center p-3 border-b hover:bg-gray-50 cursor-pointer">
+                            <div key={p.id} onClick={() => { setOpenParty(p); setShowReturn(false); setReturnProd(null); setReturnQty(''); setReturnProdQuery(''); }} className="flex justify-between items-center p-3 border-b hover:bg-gray-50 cursor-pointer">
                                 <div><div className="font-bold">{p.name}</div><div className="text-xs text-gray-500">{p.mobile}</div></div>
                                 <div className={`font-bold ${(p.balance || 0) > 0 ? 'text-red-600' : 'text-green-600'}`}>₹{(p.balance || 0).toLocaleString()}</div>
                             </div>
@@ -1646,6 +2020,37 @@
                                             {tab === 'customer' ? '− Payment Mila' : '− Payment Diya'}
                                         </button>
                                     </div>
+
+                                    {tab === 'supplier' && (
+                                        <div className="mt-2 pt-2 border-t">
+                                            <button onClick={() => setShowReturn(!showReturn)} className="text-sm bg-orange-100 text-orange-700 px-2 py-1 rounded font-bold w-full">
+                                                {showReturn ? 'Cancel' : '↩ Maal Wapas Karo (Purchase Return)'}
+                                            </button>
+                                            {showReturn && (
+                                                <div className="mt-2 space-y-2">
+                                                    <div className="relative">
+                                                        <input className="border p-2 rounded w-full text-sm" placeholder="Product search karo..."
+                                                            value={returnProd ? returnProd.name : returnProdQuery}
+                                                            onChange={e => { setReturnProdQuery(e.target.value); setReturnProd(null); }} />
+                                                        {returnProdMatches.length > 0 && !returnProd && (
+                                                            <div className="absolute top-full left-0 w-full bg-white border shadow-lg z-20 max-h-40 overflow-auto">
+                                                                {returnProdMatches.map(p => (
+                                                                    <div key={p.id} onClick={() => { setReturnProd(p); setReturnProdQuery(''); }} className="p-2 hover:bg-gray-100 cursor-pointer text-sm">
+                                                                        {p.name} (Stock: {p.stock})
+                                                                    </div>
+                                                                ))}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                    <input type="number" className="border p-2 rounded w-full text-sm" placeholder="Kitni Qty wapas kar rahe ho?" value={returnQty} onChange={e => setReturnQty(e.target.value)} />
+                                                    {returnProd && returnQty && <p className="text-xs text-gray-500">Amount: ₹{((returnProd.priceBuy || 0) * Number(returnQty)).toLocaleString()} — stock kam hoga, supplier ka payable bhi kam hoga.</p>}
+                                                    <button onClick={submitPurchaseReturn} disabled={returnBusy} className="bg-orange-600 text-white p-2 rounded font-bold text-sm w-full disabled:opacity-50">
+                                                        {returnBusy ? 'Processing...' : 'Confirm Return'}
+                                                    </button>
+                                                </div>
+                                            )}
+                                        </div>
+                                    )}
                                 </div>
 
                                 <div className="flex-1 overflow-auto p-4">
@@ -1690,11 +2095,17 @@
                 return (!filter.from || d >= filter.from) && (!filter.to || d <= filter.to);
             };
 
-            const filteredSales = sales.filter(s => inRange(s.date));
+            const filteredSales = sales.filter(s => inRange(s.date) && !s.voided);
             const filteredExpenses = expenses.filter(e => inRange(e.date));
 
-            const revenue = filteredSales.reduce((s, x) => s + (x.grandTotal || 0), 0);
-            const cogs = filteredSales.reduce((s, x) => s + (x.cart || []).reduce((cs, item) => cs + (item.priceBuy || 0) * item.qty, 0), 0);
+            // Revenue excludes GST (that's collected on behalf of the government, not real income)
+            // and excludes anything returned by customers.
+            const revenue = filteredSales.reduce((s, x) => s + (x.grandTotal || 0) - (x.gstAmount || 0) - (x.returnedTotal || 0), 0);
+            const cogs = filteredSales.reduce((s, x) => {
+                const soldCogs = (x.cart || []).reduce((cs, item) => cs + (item.priceBuy || 0) * item.qty, 0);
+                const returnedCogs = (x.cart || []).reduce((cs, item) => cs + (item.priceBuy || 0) * (item.returnedQty || 0), 0);
+                return s + soldCogs - returnedCogs;
+            }, 0);
             const grossProfit = revenue - cogs;
             const totalExpenses = filteredExpenses.reduce((s, x) => s + (x.amount || 0), 0);
             const netProfit = grossProfit - totalExpenses;
@@ -1780,6 +2191,7 @@
             const canProfit = isAdmin || perms.profit;
             const canKhata = isAdmin || perms.khata;
             const canDashboard = isAdmin || perms.dashboard;
+            const lowStockCount = useMemo(() => products.filter(p => p.stock < 10).length, [products]);
 
             const changeLang = (l) => { setLang(l); localStorage.setItem('buildmart_lang', l); };
 
@@ -1829,7 +2241,10 @@
                             {canDashboard && <button onClick={() => setView('dashboard')} className={`w-full text-left p-3 rounded ${view === 'dashboard' ? 'bg-slate-700' : ''}`}>{t(lang, 'nav_dashboard')}</button>}
                             {canPOS && <button onClick={() => setView('pos')} className={`w-full text-left p-3 rounded ${view === 'pos' ? 'bg-slate-700' : ''}`}>{t(lang, 'nav_pos')}</button>}
                             {canPOS && <button onClick={() => setView('quotation')} className={`w-full text-left p-3 rounded ${view === 'quotation' ? 'bg-slate-700' : ''}`}>{t(lang, 'nav_quotation')}</button>}
-                            {canInventory && <button onClick={() => setView('inventory')} className={`w-full text-left p-3 rounded ${view === 'inventory' ? 'bg-slate-700' : ''}`}>{t(lang, 'nav_inventory')}</button>}
+                            {canInventory && <button onClick={() => setView('inventory')} className={`w-full text-left p-3 rounded flex justify-between items-center ${view === 'inventory' ? 'bg-slate-700' : ''}`}>
+                                <span>{t(lang, 'nav_inventory')}</span>
+                                {lowStockCount > 0 && <span className="bg-red-500 text-white text-xs px-2 py-0.5 rounded-full font-bold">{lowStockCount}</span>}
+                            </button>}
                             {canKhata && <button onClick={() => setView('khata')} className={`w-full text-left p-3 rounded ${view === 'khata' ? 'bg-slate-700' : ''}`}>{t(lang, 'nav_khata')}</button>}
                             {canReports && <button onClick={() => setView('reports')} className={`w-full text-left p-3 rounded ${view === 'reports' ? 'bg-slate-700' : ''}`}>{t(lang, 'nav_reports')}</button>}
                             {canProfit && <button onClick={() => setView('profit')} className={`w-full text-left p-3 rounded ${view === 'profit' ? 'bg-slate-700' : ''}`}>{t(lang, 'nav_profit')}</button>}
@@ -1843,8 +2258,8 @@
                         {view === 'dashboard' && canDashboard && <Dashboard sales={sales} products={products} lang={lang} />}
                         {view === 'pos' && canPOS && <POS orgId={orgId} org={org} products={products} userDoc={userDoc} firebaseUser={firebaseUser} lang={lang} />}
                         {view === 'inventory' && canInventory && <Inventory orgId={orgId} products={products} isAdmin={isAdmin} lang={lang} />}
-                        {view === 'khata' && canKhata && <KhataBook orgId={orgId} userDoc={userDoc} firebaseUser={firebaseUser} />}
-                        {view === 'reports' && canReports && <SalesReport sales={sales} userDoc={userDoc} />}
+                        {view === 'khata' && canKhata && <KhataBook orgId={orgId} userDoc={userDoc} firebaseUser={firebaseUser} products={products} />}
+                        {view === 'reports' && canReports && <SalesReport orgId={orgId} sales={sales} userDoc={userDoc} />}
                         {view === 'profit' && canProfit && <ProfitLoss orgId={orgId} sales={sales} />}
                         {view === 'quotation' && canPOS && <Quotation products={products} org={org} />}
                         {view === 'users' && isAdmin && <UserMgmt orgId={orgId} org={org} />}
