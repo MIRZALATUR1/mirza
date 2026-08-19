@@ -27,6 +27,7 @@
         @media print {
             .no-print { display: none !important; }
             body { background: white; margin: 0; padding: 0; }
+            .print-area { display: block !important; }
             .print-thermal { display: block !important; width: 72mm; margin: 0; padding: 5px; font-size: 12px; font-family: 'Courier New', monospace; }
             .print-a4 { display: block !important; width: 210mm; min-height: 297mm; padding: 20mm; font-size: 14px; }
             #root > div { display: none; }
@@ -248,12 +249,25 @@
         // ============================================================
         // 2. ONBOARDING (first-time user: create new business OR join existing)
         // ============================================================
+        // Single-business mode: no matter how many org documents technically
+        // exist, the app always attaches every new sign-in to the FIRST org it
+        // finds. The very first person to ever sign in creates it and becomes
+        // owner; everyone after that is auto-attached as a pending staff
+        // request — no invite codes, no "create another business" option.
+        // (Multi-business/SaaS mode can be re-enabled later if ever needed.)
         const Onboarding = ({ user }) => {
-            const [mode, setMode] = useState(null); // 'create' | 'join'
+            const [checking, setChecking] = useState(true);
+            const [existingOrg, setExistingOrg] = useState(null); // { id, name } or null
             const [orgName, setOrgName] = useState('');
-            const [code, setCode] = useState('');
             const [busy, setBusy] = useState(false);
             const [err, setErr] = useState('');
+
+            useEffect(() => {
+                db.collection('orgs').limit(1).get().then(snap => {
+                    if (!snap.empty) setExistingOrg({ id: snap.docs[0].id, name: snap.docs[0].data().name });
+                    setChecking(false);
+                });
+            }, []);
 
             const createOrg = async (e) => {
                 e.preventDefault();
@@ -262,23 +276,13 @@
                 try {
                     const orgRef = db.collection('orgs').doc();
                     await orgRef.set({
-                        name: orgName.trim(),
-                        address: '',
-                        mobile: '',
-                        gstin: '',
-                        ownerId: user.uid,
-                        inviteCode: genInviteCode(),
-                        createdAt: FieldValue.serverTimestamp()
+                        name: orgName.trim(), address: '', mobile: '', gstin: '',
+                        ownerId: user.uid, createdAt: FieldValue.serverTimestamp()
                     });
                     await db.collection('users').doc(user.uid).set({
-                        uid: user.uid,
-                        name: user.displayName || 'Owner',
-                        email: user.email,
-                        photoURL: user.photoURL || '',
-                        orgId: orgRef.id,
-                        role: 'owner',
-                        status: 'active',
-                        createdAt: FieldValue.serverTimestamp()
+                        uid: user.uid, name: user.displayName || 'Owner', email: user.email,
+                        photoURL: user.photoURL || '', orgId: orgRef.id,
+                        role: 'owner', status: 'active', createdAt: FieldValue.serverTimestamp()
                     });
                 } catch (e2) {
                     setErr(e2.message);
@@ -286,73 +290,47 @@
                 }
             };
 
-            const joinOrg = async (e) => {
-                e.preventDefault();
-                if (!code.trim()) return;
+            const requestAccess = async () => {
                 setBusy(true); setErr('');
                 try {
-                    const snap = await db.collection('orgs').where('inviteCode', '==', code.trim().toUpperCase()).limit(1).get();
-                    if (snap.empty) {
-                        setErr('Invalid invite code. Apne admin se sahi code lein.');
-                        setBusy(false);
-                        return;
-                    }
-                    const orgDoc = snap.docs[0];
                     await db.collection('users').doc(user.uid).set({
-                        uid: user.uid,
-                        name: user.displayName || 'Staff',
-                        email: user.email,
-                        photoURL: user.photoURL || '',
-                        orgId: orgDoc.id,
-                        role: 'staff',
-                        status: 'pending',
-                        createdAt: FieldValue.serverTimestamp()
+                        uid: user.uid, name: user.displayName || 'Staff', email: user.email,
+                        photoURL: user.photoURL || '', orgId: existingOrg.id,
+                        role: 'staff', status: 'pending', createdAt: FieldValue.serverTimestamp()
                     });
                 } catch (e2) {
                     setErr(e2.message);
                     setBusy(false);
                 }
             };
+
+            if (checking) return <div className="min-h-screen flex items-center justify-center bg-slate-800 text-white">Loading...</div>;
 
             return (
                 <div className="min-h-screen flex items-center justify-center bg-slate-800 p-4">
-                    <div className="bg-white p-8 rounded-lg shadow-xl w-full max-w-md">
-                        <h2 className="text-xl font-bold text-center mb-1">Namaste, {user.displayName}!</h2>
-                        <p className="text-center text-gray-500 mb-6 text-sm">Shuru karne ke liye ek option chunein</p>
+                    <div className="bg-white p-8 rounded-lg shadow-xl w-full max-w-md text-center">
+                        <h2 className="text-xl font-bold mb-1">Namaste, {user.displayName}!</h2>
 
-                        {!mode && (
-                            <div className="space-y-3">
-                                <button onClick={() => setMode('create')} className="w-full bg-orange-600 hover:bg-orange-700 text-white p-3 rounded font-bold">
-                                    🏪 Naya Business Shuru Karein
-                                </button>
-                                <button onClick={() => setMode('join')} className="w-full bg-slate-700 hover:bg-slate-800 text-white p-3 rounded font-bold">
-                                    🔗 Existing Business Join Karein
-                                </button>
-                            </div>
+                        {!existingOrg && (
+                            <>
+                                <p className="text-gray-500 mb-6 text-sm">Aap sabse pehle login karne wale hain — apna business set up karein.</p>
+                                <form onSubmit={createOrg} className="space-y-4 text-left">
+                                    <label className="block text-sm font-medium">Business / Shop Ka Naam</label>
+                                    <input autoFocus className="w-full border p-2 rounded" placeholder="e.g. Mirza Traders" value={orgName} onChange={e => setOrgName(e.target.value)} required />
+                                    {err && <p className="text-red-500 text-sm">{err}</p>}
+                                    <button disabled={busy} className="w-full bg-orange-600 hover:bg-orange-700 text-white p-3 rounded font-bold disabled:opacity-50">{busy ? 'Setting up...' : 'Business Shuru Karein'}</button>
+                                </form>
+                            </>
                         )}
 
-                        {mode === 'create' && (
-                            <form onSubmit={createOrg} className="space-y-4">
-                                <label className="block text-sm font-medium">Business / Shop Ka Naam</label>
-                                <input autoFocus className="w-full border p-2 rounded" placeholder="e.g. Mirza Traders" value={orgName} onChange={e => setOrgName(e.target.value)} required />
-                                {err && <p className="text-red-500 text-sm">{err}</p>}
-                                <div className="flex gap-2">
-                                    <button type="button" onClick={() => setMode(null)} className="bg-gray-200 p-2 rounded flex-1">Back</button>
-                                    <button disabled={busy} className="bg-green-600 text-white p-2 rounded flex-1 font-bold disabled:opacity-50">{busy ? 'Creating...' : 'Create'}</button>
-                                </div>
-                            </form>
-                        )}
-
-                        {mode === 'join' && (
-                            <form onSubmit={joinOrg} className="space-y-4">
-                                <label className="block text-sm font-medium">Invite Code (admin se lein)</label>
-                                <input autoFocus className="w-full border p-2 rounded uppercase tracking-widest text-center font-bold" placeholder="ABC123" value={code} onChange={e => setCode(e.target.value)} required />
-                                {err && <p className="text-red-500 text-sm">{err}</p>}
-                                <div className="flex gap-2">
-                                    <button type="button" onClick={() => setMode(null)} className="bg-gray-200 p-2 rounded flex-1">Back</button>
-                                    <button disabled={busy} className="bg-blue-600 text-white p-2 rounded flex-1 font-bold disabled:opacity-50">{busy ? 'Sending...' : 'Request to Join'}</button>
-                                </div>
-                            </form>
+                        {existingOrg && (
+                            <>
+                                <p className="text-gray-500 mb-6 text-sm"><strong>{existingOrg.name}</strong> me access ke liye admin ko request bhejein. Approve hote hi aap login kar sakenge.</p>
+                                {err && <p className="text-red-500 text-sm mb-3">{err}</p>}
+                                <button onClick={requestAccess} disabled={busy} className="w-full bg-blue-600 hover:bg-blue-700 text-white p-3 rounded font-bold disabled:opacity-50">
+                                    {busy ? 'Sending...' : 'Access Request Bhejein'}
+                                </button>
+                            </>
                         )}
                     </div>
                 </div>
@@ -757,9 +735,10 @@
         // ============================================================
         // 6. POS / BILLING
         // ============================================================
-        const POS = ({ orgId, org, products, userDoc, firebaseUser }) => {
+        const POS = ({ orgId, org, products, userDoc, firebaseUser, lang }) => {
             const [cart, setCart] = useState([]);
             const [query, setQuery] = useState('');
+            const [catFilter, setCatFilter] = useState('All');
             const [selectedProd, setSelectedProd] = useState(null);
             const [qtyInput, setQtyInput] = useState('');
             const [billType, setBillType] = useState('Estimate');
@@ -779,7 +758,14 @@
                 return () => window.removeEventListener('keydown', handleKey);
             }, [cart, customer]);
 
-            const filteredProducts = query ? products.filter(p => p.name.toLowerCase().includes(query.toLowerCase())) : [];
+            // Always show a browsable list: filter by typed search AND/OR selected category chip.
+            // (Previously nothing showed until you typed — now staff can browse type-wise too.)
+            const filteredProducts = products
+                .filter(p => !query || p.name.toLowerCase().includes(query.toLowerCase()) || (p.brand || '').toLowerCase().includes(query.toLowerCase()))
+                .filter(p => catFilter === 'All' || p.category === catFilter)
+                .sort((a, b) => a.category === b.category ? a.name.localeCompare(b.name) : a.category.localeCompare(b.category));
+
+            const categoriesInStock = ['All', ...CATEGORIES.filter(c => products.some(p => p.category === c))];
 
             const addToCart = (e) => {
                 e.preventDefault();
@@ -874,16 +860,31 @@
             return (
                 <div className="flex h-full gap-4 p-4">
                     <div className="w-2/3 bg-white rounded shadow p-4 flex flex-col">
-                        <div className="flex gap-2 mb-4">
+                        <div className="flex gap-2 mb-3">
                             <input ref={searchRef} className="flex-1 border-2 border-blue-500 rounded p-3 text-lg" placeholder="F2: Search Product (Cement, Pipe...)" value={query} onChange={e => setQuery(e.target.value)} />
+                        </div>
+                        <div className="flex flex-wrap gap-1 mb-3">
+                            {categoriesInStock.map(c => (
+                                <button key={c} onClick={() => setCatFilter(c)}
+                                    className={`px-3 py-1 rounded-full text-sm border ${catFilter === c ? 'bg-orange-600 text-white border-orange-600' : 'bg-white text-gray-600 hover:bg-gray-50'}`}>
+                                    {c === 'All' ? 'Sab' : catLabel(lang || 'en', c)}
+                                </button>
+                            ))}
                         </div>
                         <div className="flex-1 overflow-auto grid grid-cols-2 md:grid-cols-3 gap-3 content-start">
                             {filteredProducts.length > 0 ? filteredProducts.map(p => (
                                 <div key={p.id} onClick={() => selectProduct(p)} className={`cursor-pointer border p-3 rounded hover:bg-blue-50 transition flex justify-between items-center ${p.stock < 5 ? 'bg-red-50' : ''}`}>
-                                    <div><div className="font-bold">{p.name}</div><div className="text-xs text-gray-500">{p.category} | {p.stock} {p.unit}</div></div>
+                                    <div>
+                                        <div className="font-bold">{p.name}</div>
+                                        <div className="text-xs text-gray-500">{catLabel(lang || 'en', p.category)}{p.brand ? ' · ' + p.brand : ''} | {p.stock} {unitLabel(lang || 'en', p.unit)}</div>
+                                    </div>
                                     <div className="text-blue-600 font-bold">₹{p.priceSell}</div>
                                 </div>
-                            )) : <div className="col-span-3 text-center text-gray-400 mt-10">Type to search...</div>}
+                            )) : (
+                                <div className="col-span-3 text-center text-gray-400 mt-10">
+                                    {products.length === 0 ? 'Inventory me abhi koi material nahi hai — pehle Inventory se add karo.' : 'Koi match nahi mila.'}
+                                </div>
+                            )}
                         </div>
                     </div>
 
@@ -1100,7 +1101,6 @@
 
         const UserMgmt = ({ orgId, org }) => {
             const [users, setUsers] = useState([]);
-            const [copied, setCopied] = useState(false);
             const [expandedId, setExpandedId] = useState(null);
 
             useEffect(() => {
@@ -1138,28 +1138,13 @@
             };
             const reEnable = async (u) => { await db.collection('users').doc(u.id).update({ status: 'active' }); };
 
-            const regenerateCode = async () => {
-                if (!confirm('Purana invite code kaam nahi karega. Continue?')) return;
-                await db.collection('orgs').doc(orgId).update({ inviteCode: genInviteCode() });
-            };
-            const copyCode = () => {
-                navigator.clipboard.writeText(org.inviteCode);
-                setCopied(true); setTimeout(() => setCopied(false), 1500);
-            };
-
             return (
                 <div className="p-6 overflow-auto">
                     <h2 className="text-xl font-bold mb-4">Staff & Admin Management</h2>
-
-                    <div className="bg-white p-4 rounded shadow mb-6 max-w-2xl border-l-4 border-blue-500">
-                        <h3 className="font-bold mb-2">Invite Code</h3>
-                        <p className="text-sm text-gray-500 mb-2">Staff ko ye code dein taaki wo "Join Existing Business" se request bhej sakein.</p>
-                        <div className="flex items-center gap-2">
-                            <span className="text-2xl font-bold tracking-widest bg-gray-100 px-4 py-2 rounded">{org.inviteCode}</span>
-                            <button onClick={copyCode} className="bg-slate-700 text-white px-3 py-2 rounded text-sm">{copied ? 'Copied!' : 'Copy'}</button>
-                            <button onClick={regenerateCode} className="bg-red-100 text-red-700 px-3 py-2 rounded text-sm">Regenerate</button>
-                        </div>
-                    </div>
+                    <p className="text-sm text-gray-500 mb-4 max-w-2xl">
+                        Naya staff member sirf Google se login karke <strong>"Access Request Bhejein"</strong> dabayega —
+                        uska request neeche "Pending Approvals" me apne aap aa jayega, koi code share karne ki zaroorat nahi.
+                    </p>
 
                     {pending.length > 0 && (
                         <div className="bg-white p-4 rounded shadow mb-6 max-w-2xl border-l-4 border-yellow-500">
