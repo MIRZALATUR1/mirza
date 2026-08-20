@@ -395,12 +395,18 @@
         function t(lang, key) { return (TRANSLATIONS[lang] && TRANSLATIONS[lang][key]) || TRANSLATIONS.en[key] || key; }
 
         // Opens WhatsApp (app on phone, WhatsApp Web on desktop) with a message
-        // pre-filled for the given number — no backend/API needed, the staff just
-        // taps Send. Assumes Indian 10-digit mobile numbers if no country code given.
+        // pre-filled for the given number, directly on that customer's chat —
+        // no backend/API needed, the staff just taps Send.
         function sendWhatsApp(mobile, message) {
             if (!mobile) { alert('Mobile number nahi hai.'); return; }
-            let digits = mobile.replace(/\D/g, '');
+            // Strip everything except digits, then drop any leading zero(s) —
+            // e.g. "09876543210" or "0 98765 43210" both need to become
+            // "9876543210" before adding the 91 country code. Without this,
+            // wa.me gets an invalid number and WhatsApp can't open that exact
+            // chat directly (it falls back to "save this contact first").
+            let digits = mobile.replace(/\D/g, '').replace(/^0+/, '');
             if (digits.length === 10) digits = '91' + digits;
+            if (digits.length < 11) { alert('Mobile number sahi nahi lag raha (10 digit hona chahiye), check karke dobara try karo.'); return; }
             window.open(`https://wa.me/${digits}?text=${encodeURIComponent(message)}`, '_blank');
         }
 
@@ -2140,9 +2146,12 @@
                         <div className="fixed bottom-4 right-4 bg-white shadow-xl border rounded-lg p-4 z-40 w-72">
                             <p className="text-sm font-bold mb-2">Bill save ho gaya ✓</p>
                             {lastSale.customer.mobile ? (
-                                <button onClick={() => shareViaWhatsApp(lastSale, org)} className="w-full bg-green-600 text-white p-2 rounded font-bold text-sm mb-1">📱 Send PDF via WhatsApp</button>
+                                <>
+                                    <button onClick={() => { sendWhatsApp(lastSale.customer.mobile, buildBillMessage(lastSale, org)); setLastSale(null); }} className="w-full bg-green-600 text-white p-2 rounded font-bold text-sm mb-1">📱 Send via WhatsApp</button>
+                                    <button onClick={() => { shareViaWhatsApp(lastSale, org); setLastSale(null); }} className="w-full bg-green-50 text-green-700 border border-green-200 p-2 rounded text-xs mb-1">📎 PDF Attach Karke Bhejo (contact khud choose karna hoga)</button>
+                                </>
                             ) : <p className="text-xs text-gray-400 mb-1">Customer ka mobile number nahi tha.</p>}
-                            <button onClick={() => downloadBillPDF(lastSale, org)} className="w-full bg-gray-100 text-gray-600 p-2 rounded text-xs mb-1">Sirf PDF Download Karo</button>
+                            <button onClick={() => { downloadBillPDF(lastSale, org); setLastSale(null); }} className="w-full bg-gray-100 text-gray-600 p-2 rounded text-xs mb-1">Sirf PDF Download Karo</button>
                             <button onClick={() => setLastSale(null)} className="w-full bg-gray-100 text-gray-600 p-1 rounded text-xs">Close</button>
                         </div>
                     )}
@@ -2467,7 +2476,10 @@
                                             <button onClick={() => reprintSale(s)} className="text-gray-600 text-xs border px-2 py-1 rounded mr-1">🖨 Reprint</button>
                                             <button onClick={() => downloadBillPDF(s, org)} className="text-blue-600 text-xs border px-2 py-1 rounded mr-1">📄 PDF</button>
                                             {s.customer.mobile && (
-                                                <button onClick={() => shareViaWhatsApp(s, org)} className="text-green-600 text-xs border px-2 py-1 rounded mr-1">📱</button>
+                                                <>
+                                                    <button onClick={() => sendWhatsApp(s.customer.mobile, buildBillMessage(s, org))} title="Seedha message bhejo" className="text-green-600 text-xs border px-2 py-1 rounded mr-1">📱</button>
+                                                    <button onClick={() => shareViaWhatsApp(s, org)} title="PDF attach karke bhejo (contact khud choose karna hoga)" className="text-green-700 text-xs border px-2 py-1 rounded mr-1">📎</button>
+                                                </>
                                             )}
                                             {isAdmin && !s.voided && (
                                                 <>
