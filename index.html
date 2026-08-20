@@ -2076,7 +2076,7 @@
                     if (!hsnMap[key]) hsnMap[key] = { hsn, gstRate: item.gst || 0, qty: 0, taxableValue: 0, unit: item.unit };
                     hsnMap[key].qty += item.qty;
                     hsnMap[key].taxableValue += item.total;
-                });
+                }));
                 let csv2 = 'HSN Code,UQC (Unit),Total Qty,Taxable Value,GST Rate,Tax Amount\n';
                 Object.values(hsnMap).forEach(h => {
                     const tax = h.taxableValue * (h.gstRate / 100);
