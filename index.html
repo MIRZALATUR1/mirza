@@ -438,15 +438,15 @@
             doc.autoTable({
                 startY: 43,
                 head: [['Item', 'Qty', 'Rate', 'Total']],
-                body: (sale.cart || []).map(it => [it.name, `${it.qty} ${it.unit}`, `₹${it.finalPrice.toFixed(2)}`, `₹${it.total.toFixed(2)}`]),
+                body: (sale.cart || []).map(it => [it.name, `${it.qty} ${it.unit}`, `Rs.${it.finalPrice.toFixed(2)}`, `Rs.${it.total.toFixed(2)}`]),
                 styles: { fontSize: 10 }
             });
             const y = doc.lastAutoTable.finalY + 8;
             doc.setFontSize(11);
-            doc.text(`Grand Total: ₹${sale.grandTotal.toFixed(2)}`, 14, y);
+            doc.text(`Grand Total: Rs.${sale.grandTotal.toFixed(2)}`, 14, y);
             const paidAmt = sale.cashAmount != null ? sale.cashAmount : (sale.grandTotal - (sale.udharAmount || 0));
-            if (paidAmt > 0) doc.text(`Paid: ₹${paidAmt.toFixed(2)}`, 14, y + 7);
-            if (sale.udharAmount > 0) doc.text(`Udhar Due: ₹${sale.udharAmount.toFixed(2)}`, 14, y + 14);
+            if (paidAmt > 0) doc.text(`Paid: Rs.${paidAmt.toFixed(2)}`, 14, y + 7);
+            if (sale.udharAmount > 0) doc.text(`Udhar Due: Rs.${sale.udharAmount.toFixed(2)}`, 14, y + 14);
             return doc;
         }
 
@@ -1591,6 +1591,8 @@
             const [udharDueDate, setUdharDueDate] = useState('');
             const [billDiscount, setBillDiscount] = useState(''); // extra flat ₹ discount on the whole bill
             const [customer, setCustomer] = useState({ name: '', mobile: '', gst: '', address: '' });
+            const [existingCustomerInfo, setExistingCustomerInfo] = useState(null); // { fromDirectory, party } — looked up when mobile is entered
+            const [lookupBusy, setLookupBusy] = useState(false);
             const [saving, setSaving] = useState(false);
             const [heldBills, setHeldBills] = useState([]);
             const [showHeld, setShowHeld] = useState(false);
@@ -1598,6 +1600,40 @@
 
             const searchRef = useRef();
             const qtyRef = useRef();
+
+            // When staff finishes typing a mobile number, check if we've seen this
+            // customer before (Customer Directory) and auto-fill their name/address,
+            // and check the Udhar Khata for any existing pending balance so staff
+            // (and the customer) can see it before billing continues.
+            const lookupCustomerByMobile = async () => {
+                const mobile = customer.mobile.trim();
+                if (mobile.length < 10) { setExistingCustomerInfo(null); return; }
+                setLookupBusy(true);
+                try {
+                    const [custSnap, partySnap] = await Promise.all([
+                        db.collection('orgs').doc(orgId).collection('customers').where('mobile', '==', mobile).limit(1).get(),
+                        db.collection('orgs').doc(orgId).collection('parties').where('type', '==', 'customer').where('mobile', '==', mobile).limit(1).get()
+                    ]);
+                    const dir = custSnap.empty ? null : { id: custSnap.docs[0].id, ...custSnap.docs[0].data() };
+                    const party = partySnap.empty ? null : { id: partySnap.docs[0].id, ...partySnap.docs[0].data() };
+                    if (dir || party) {
+                        setExistingCustomerInfo({ directory: dir, party });
+                        // Auto-fill only if staff hasn't already typed something different.
+                        setCustomer(prev => ({
+                            ...prev,
+                            name: prev.name || (dir && dir.name) || (party && party.name) || '',
+                            address: prev.address || (dir && dir.address) || ''
+                        }));
+                    } else {
+                        setExistingCustomerInfo(null);
+                    }
+                } catch (e) {
+                    console.error('Customer lookup failed:', e);
+                } finally {
+                    setLookupBusy(false);
+                }
+            };
+
 
             useEffect(() => {
                 const unsub = db.collection('orgs').doc(orgId).collection('heldBills').orderBy('createdAt', 'desc').onSnapshot(snap => {
@@ -1855,7 +1891,7 @@
                     }
 
                     setLastSale({ ...saleData, id: saleRef.id });
-                    setCart([]); setCustomer({ name: '', mobile: '', gst: '', address: '' }); setQuery('');
+                    setCart([]); setCustomer({ name: '', mobile: '', gst: '', address: '' }); setQuery(''); setExistingCustomerInfo(null);
                     setPaymentMode('Cash'); setPaymentMethod('Cash'); setSplitCash(''); setUdharSite(''); setUdharDueDate(''); setBillDiscount('');
                 } catch (e) {
                     alert('Error: ' + e.message);
@@ -1949,10 +1985,23 @@
                                 </div>
                             )}
                             <input className="border p-1 rounded w-full text-sm" placeholder={paymentMode !== 'Cash' ? t(lang, 'pos_customerNameReq') : t(lang, 'pos_customerName')} value={customer.name} onChange={e => setCustomer({ ...customer, name: e.target.value })} />
-                            {(paymentMode !== 'Cash' || billType === 'Tax Invoice') && (
-                                <div className="flex gap-1">
-                                    {billType === 'Tax Invoice' && <input className="border p-1 rounded text-sm w-2/3" placeholder={t(lang, 'pos_gstin')} value={customer.gst} onChange={e => setCustomer({ ...customer, gst: e.target.value })} onBlur={fetchGST} />}
-                                    <input className={`border p-1 rounded text-sm ${billType === 'Tax Invoice' ? 'w-1/3' : 'w-full'}`} placeholder={t(lang, 'pos_mobile')} value={customer.mobile} onChange={e => setCustomer({ ...customer, mobile: e.target.value })} />
+                            <div className="flex gap-1">
+                                {billType === 'Tax Invoice' && <input className="border p-1 rounded text-sm w-2/3" placeholder={t(lang, 'pos_gstin')} value={customer.gst} onChange={e => setCustomer({ ...customer, gst: e.target.value })} onBlur={fetchGST} />}
+                                <input className={`border p-1 rounded text-sm ${billType === 'Tax Invoice' ? 'w-1/3' : 'w-full'}`} placeholder={t(lang, 'pos_mobile') + ' (WhatsApp ke liye)'} value={customer.mobile}
+                                    onChange={e => { setCustomer({ ...customer, mobile: e.target.value }); setExistingCustomerInfo(null); }}
+                                    onBlur={lookupCustomerByMobile} />
+                            </div>
+                            <input className="border p-1 rounded w-full text-sm" placeholder="Address (optional)" value={customer.address} onChange={e => setCustomer({ ...customer, address: e.target.value })} />
+                            {lookupBusy && <p className="text-xs text-gray-400">Customer check ho raha hai...</p>}
+                            {existingCustomerInfo && (
+                                <div className="bg-blue-50 border border-blue-200 rounded p-2 text-xs">
+                                    <p className="font-bold text-blue-700">👤 Pehchana hua customer{existingCustomerInfo.directory ? ` — ${existingCustomerInfo.directory.totalPurchases || 0} baar pehle khareeda` : ''}</p>
+                                    {existingCustomerInfo.party && (existingCustomerInfo.party.balance || 0) > 0 && (
+                                        <p className="text-red-600 font-bold mt-1">
+                                            🔴 Pehle se udhar bakaya: ₹{existingCustomerInfo.party.balance.toLocaleString()}
+                                            {existingCustomerInfo.party.creditLimit > 0 ? ` (Limit: ₹${existingCustomerInfo.party.creditLimit.toLocaleString()})` : ''}
+                                        </p>
+                                    )}
                                 </div>
                             )}
                             {paymentMode !== 'Cash' && (
@@ -2148,7 +2197,7 @@
                     head: [['Bill ID', 'Date', 'Customer', 'Type', 'Payment', 'Staff', 'Amount']],
                     body: filteredSales.map(s => [
                         s.id.toString().slice(-8), new Date(s.date).toLocaleDateString(), s.customer.name || 'Walk-in',
-                        s.billType, s.paymentMode || 'Cash', s.staffName, (s.voided ? 'VOID ' : '') + '₹' + s.grandTotal.toFixed(2)
+                        s.billType, s.paymentMode || 'Cash', s.staffName, (s.voided ? 'VOID ' : '') + 'Rs.' + s.grandTotal.toFixed(2)
                     ]),
                     styles: { fontSize: 8 }
                 });
@@ -2252,13 +2301,13 @@
                 doc.setFontSize(14);
                 doc.text('Purchase Report', 14, 15);
                 doc.setFontSize(9);
-                doc.text(`${filter.from || 'Start'} to ${filter.to || 'Today'} · Total: ₹${purchaseTotal.toFixed(2)}`, 14, 21);
+                doc.text(`${filter.from || 'Start'} to ${filter.to || 'Today'} · Total: Rs.${purchaseTotal.toFixed(2)}`, 14, 21);
                 doc.autoTable({
                     startY: 26,
                     head: [['Date', 'Product', 'Qty', 'Rate', 'GST', 'Total', 'Payment', 'Supplier']],
                     body: filteredPurchases.map(p => [
-                        new Date(p.date).toLocaleDateString(), p.productName, p.qty, '₹' + p.rate,
-                        '₹' + (p.gstAmount || 0).toFixed(2), '₹' + p.total.toFixed(2), p.paymentMode, p.supplierName || '-'
+                        new Date(p.date).toLocaleDateString(), p.productName, p.qty, 'Rs.' + p.rate,
+                        'Rs.' + (p.gstAmount || 0).toFixed(2), 'Rs.' + p.total.toFixed(2), p.paymentMode, p.supplierName || '-'
                     ]),
                     styles: { fontSize: 8 }
                 });
@@ -3077,7 +3126,7 @@
         // ============================================================
         // 11. KHATA BOOK — Udhar diya (customers) / Udhar liya (suppliers)
         // ============================================================
-        const KhataBook = ({ orgId, org, userDoc, firebaseUser, products, sales, lang }) => {
+        const KhataBook = ({ orgId, org, userDoc, firebaseUser, products, sales, lang, isAdmin }) => {
             const [tab, setTab] = useState('customer'); // customer | supplier | directory
             const [parties, setParties] = useState([]);
             const [search, setSearch] = useState('');
@@ -3097,6 +3146,12 @@
             const [siteFilter, setSiteFilter] = useState('All');
             const [customersList, setCustomersList] = useState([]);
             const [openCustomer, setOpenCustomer] = useState(null);
+            const [showAddCustomer, setShowAddCustomer] = useState(false);
+            const [customerForm, setCustomerForm] = useState({ name: '', mobile: '', address: '' });
+            const [editingCustomerId, setEditingCustomerId] = useState(null);
+            const [showDeletedCustomers, setShowDeletedCustomers] = useState(false);
+
+            const customersRef = db.collection('orgs').doc(orgId).collection('customers');
 
             const partiesRef = db.collection('orgs').doc(orgId).collection('parties');
 
@@ -3191,6 +3246,47 @@
 
             const setCreditLimit = async (val) => {
                 await partiesRef.doc(openParty.id).update({ creditLimit: Number(val) || 0 });
+            };
+
+            // ------- Customer Directory: Add / Edit / Delete / Restore -------
+            const openAddCustomer = () => {
+                setCustomerForm({ name: '', mobile: '', address: '' });
+                setEditingCustomerId(null);
+                setShowAddCustomer(true);
+            };
+            const openEditCustomer = (c) => {
+                setCustomerForm({ name: c.name || '', mobile: c.mobile || '', address: c.address || '' });
+                setEditingCustomerId(c.id);
+                setShowAddCustomer(true);
+            };
+            const saveCustomer = async (e) => {
+                e.preventDefault();
+                if (!customerForm.name.trim() && !customerForm.mobile.trim()) return;
+                if (editingCustomerId) {
+                    await customersRef.doc(editingCustomerId).update({
+                        name: customerForm.name.trim(), mobile: customerForm.mobile.trim(), address: customerForm.address.trim()
+                    });
+                } else {
+                    await customersRef.add({
+                        name: customerForm.name.trim(), mobile: customerForm.mobile.trim(), address: customerForm.address.trim(),
+                        totalPurchases: 0, totalSpent: 0, deleted: false, createdAt: FieldValue.serverTimestamp()
+                    });
+                }
+                setShowAddCustomer(false);
+                setCustomerForm({ name: '', mobile: '', address: '' });
+                setEditingCustomerId(null);
+            };
+            // Any staff with Khata access can remove a customer from the active
+            // list (e.g. duplicate entry) — but only an ADMIN can bring it back,
+            // so accidental/careless deletes can always be recovered by the owner.
+            const deleteCustomer = async (c) => {
+                if (confirm(`"${c.name || c.mobile}" ko directory se hatana hai? Admin baad me restore kar sakta hai.`)) {
+                    await customersRef.doc(c.id).update({ deleted: true, deletedAt: FieldValue.serverTimestamp() });
+                    setOpenCustomer(null);
+                }
+            };
+            const restoreCustomer = async (c) => {
+                await customersRef.doc(c.id).update({ deleted: false, deletedAt: FieldValue.delete() });
             };
 
             const submitPurchaseReturn = async () => {
@@ -3431,32 +3527,75 @@
                         <div>
                             <div className="mb-4 p-4 rounded shadow bg-blue-600 text-white">
                                 <p className="text-sm opacity-90">Total Customers (Kabhi Bhi Khareeda)</p>
-                                <h3 className="text-2xl font-bold">{customersList.length}</h3>
+                                <h3 className="text-2xl font-bold">{customersList.filter(c => !c.deleted).length}</h3>
                                 <p className="text-xs opacity-75 mt-1">Cash aur Udhar dono customers yahan hain — sirf udhar wale nahi.</p>
                             </div>
-                            <input className="border p-2 rounded w-full mb-4" placeholder="Naam ya mobile se search karo..." value={search} onChange={e => setSearch(e.target.value)} />
+                            <div className="flex gap-2 mb-4">
+                                <input className="border p-2 rounded flex-1" placeholder="Naam ya mobile se search karo..." value={search} onChange={e => setSearch(e.target.value)} />
+                                <button onClick={openAddCustomer} className="bg-slate-700 text-white px-4 py-2 rounded font-bold whitespace-nowrap">+ Naya Customer</button>
+                            </div>
                             <div className="bg-white rounded shadow overflow-hidden">
                                 <table className="w-full text-sm">
                                     <thead className="bg-gray-100 border-b text-left">
-                                        <tr><th className="p-3">Naam</th><th className="p-3">Mobile</th><th className="p-3">Kitni Baar Aaya</th><th className="p-3 text-right">Total Khareeda</th><th className="p-3">Last Purchase</th></tr>
+                                        <tr><th className="p-3">Naam</th><th className="p-3">Mobile</th><th className="p-3">Kitni Baar Aaya</th><th className="p-3 text-right">Total Khareeda</th><th className="p-3">Last Purchase</th><th className="p-3">Action</th></tr>
                                     </thead>
                                     <tbody>
                                         {customersList
-                                            .filter(c => !search || c.name.toLowerCase().includes(search.toLowerCase()) || (c.mobile || '').includes(search))
+                                            .filter(c => !c.deleted)
+                                            .filter(c => !search || (c.name || '').toLowerCase().includes(search.toLowerCase()) || (c.mobile || '').includes(search))
                                             .sort((a, b) => (b.totalSpent || 0) - (a.totalSpent || 0))
                                             .map(c => (
-                                                <tr key={c.id} onClick={() => setOpenCustomer(c)} className="border-b hover:bg-gray-50 cursor-pointer">
-                                                    <td className="p-3 font-bold">{c.name || 'Walk-in'}</td>
-                                                    <td className="p-3">{c.mobile || '—'}</td>
-                                                    <td className="p-3">{c.totalPurchases || 0}</td>
-                                                    <td className="p-3 text-right font-bold">₹{(c.totalSpent || 0).toLocaleString()}</td>
-                                                    <td className="p-3 text-xs text-gray-500">{c.lastPurchaseDate ? new Date(c.lastPurchaseDate).toLocaleDateString() : '—'}</td>
+                                                <tr key={c.id} className="border-b hover:bg-gray-50">
+                                                    <td className="p-3 font-bold cursor-pointer" onClick={() => setOpenCustomer(c)}>{c.name || 'Walk-in'}</td>
+                                                    <td className="p-3 cursor-pointer" onClick={() => setOpenCustomer(c)}>{c.mobile || '—'}</td>
+                                                    <td className="p-3 cursor-pointer" onClick={() => setOpenCustomer(c)}>{c.totalPurchases || 0}</td>
+                                                    <td className="p-3 text-right font-bold cursor-pointer" onClick={() => setOpenCustomer(c)}>₹{(c.totalSpent || 0).toLocaleString()}</td>
+                                                    <td className="p-3 text-xs text-gray-500 cursor-pointer" onClick={() => setOpenCustomer(c)}>{c.lastPurchaseDate ? new Date(c.lastPurchaseDate).toLocaleDateString() : '—'}</td>
+                                                    <td className="p-3 whitespace-nowrap">
+                                                        <button onClick={() => openEditCustomer(c)} className="text-blue-600 text-xs border px-2 py-1 rounded mr-1">Edit</button>
+                                                        <button onClick={() => deleteCustomer(c)} className="text-red-600 text-xs border px-2 py-1 rounded">Delete</button>
+                                                    </td>
                                                 </tr>
                                             ))}
                                     </tbody>
                                 </table>
-                                {customersList.length === 0 && <div className="p-4 text-center text-gray-500">Abhi tak koi customer save nahi hua. Jaise hi POS se pehli sale hogi, yahan dikhega.</div>}
+                                {customersList.filter(c => !c.deleted).length === 0 && <div className="p-4 text-center text-gray-500">Abhi tak koi customer save nahi hua. Jaise hi POS se pehli sale hogi, yahan dikhega.</div>}
                             </div>
+
+                            {isAdmin && customersList.some(c => c.deleted) && (
+                                <div className="mt-4">
+                                    <button onClick={() => setShowDeletedCustomers(!showDeletedCustomers)} className="text-sm text-red-600 font-bold underline">
+                                        {showDeletedCustomers ? 'Deleted Customers Chhupao' : `🗑 Deleted Customers Dekho (${customersList.filter(c => c.deleted).length})`}
+                                    </button>
+                                    {showDeletedCustomers && (
+                                        <div className="bg-white rounded shadow overflow-hidden mt-2">
+                                            {customersList.filter(c => c.deleted).map(c => (
+                                                <div key={c.id} className="flex justify-between items-center p-3 border-b opacity-60">
+                                                    <div><span className="font-bold">{c.name || 'Walk-in'}</span> <span className="text-xs text-gray-500">{c.mobile}</span></div>
+                                                    <button onClick={() => restoreCustomer(c)} className="text-green-600 text-xs border px-2 py-1 rounded font-bold">↩ Restore</button>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
+                                </div>
+                            )}
+                        </div>
+                    )}
+
+                    {showAddCustomer && (
+                        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+                            <form onSubmit={saveCustomer} className="bg-white p-6 rounded shadow-xl w-96">
+                                <h3 className="font-bold text-lg mb-4">{editingCustomerId ? 'Customer Edit Karo' : 'Naya Customer'}</h3>
+                                <div className="space-y-3">
+                                    <input autoFocus className="w-full border p-2 rounded" placeholder="Naam" value={customerForm.name} onChange={e => setCustomerForm({ ...customerForm, name: e.target.value })} />
+                                    <input className="w-full border p-2 rounded" placeholder="Mobile" value={customerForm.mobile} onChange={e => setCustomerForm({ ...customerForm, mobile: e.target.value })} />
+                                    <input className="w-full border p-2 rounded" placeholder="Address (optional)" value={customerForm.address} onChange={e => setCustomerForm({ ...customerForm, address: e.target.value })} />
+                                </div>
+                                <div className="grid grid-cols-2 gap-2 mt-4">
+                                    <button type="button" onClick={() => { setShowAddCustomer(false); setEditingCustomerId(null); }} className="bg-gray-200 p-2 rounded">Cancel</button>
+                                    <button type="submit" className="bg-blue-600 text-white p-2 rounded font-bold">{editingCustomerId ? 'Save' : 'Create'}</button>
+                                </div>
+                            </form>
                         </div>
                     )}
 
@@ -3850,7 +3989,7 @@
                         {view === 'dashboard' && canDashboard && <Dashboard sales={sales} products={products} lang={lang} />}
                         {view === 'pos' && canPOS && <POS orgId={orgId} org={org} products={products} userDoc={userDoc} firebaseUser={firebaseUser} lang={lang} />}
                         {view === 'inventory' && canInventory && <Inventory orgId={orgId} products={products} isAdmin={isAdmin} lang={lang} userDoc={userDoc} />}
-                        {view === 'khata' && canKhata && <KhataBook orgId={orgId} org={org} userDoc={userDoc} firebaseUser={firebaseUser} products={products} sales={sales} lang={lang} />}
+                        {view === 'khata' && canKhata && <KhataBook orgId={orgId} org={org} userDoc={userDoc} firebaseUser={firebaseUser} products={products} sales={sales} lang={lang} isAdmin={isAdmin} />}
                         {view === 'reports' && canReports && <SalesReport orgId={orgId} org={org} sales={sales} purchases={purchases} products={products} userDoc={userDoc} lang={lang} />}
                         {view === 'profit' && canProfit && <ProfitLoss orgId={orgId} org={org} sales={sales} lang={lang} />}
                         {view === 'quotation' && canPOS && <Quotation products={products} org={org} />}
@@ -3983,6 +4122,7 @@
                             <span>Date: ${new Date(data.date).toLocaleDateString()}</span>
                         </div>
                         <div style="font-size:10px;">Customer: ${data.customer.name || 'Cash Sale'}</div>
+                        ${data.customer.address ? `<div style="font-size:10px;">${data.customer.address}</div>` : ''}
                         <hr style="border-top: 1px dashed #000; margin: 5px 0;">
                         <table style="width:100%; text-align:left; font-size:11px;">
                             <thead><tr><th>Item</th><th style="text-align:right">Qty</th><th style="text-align:right">Amt</th></tr></thead>
