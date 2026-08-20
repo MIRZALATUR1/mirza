@@ -407,7 +407,13 @@
             let digits = mobile.replace(/\D/g, '').replace(/^0+/, '');
             if (digits.length === 10) digits = '91' + digits;
             if (digits.length < 11) { alert('Mobile number sahi nahi lag raha (10 digit hona chahiye), check karke dobara try karo.'); return; }
-            window.open(`https://wa.me/${digits}?text=${encodeURIComponent(message)}`, '_blank');
+            // Using a fixed window NAME (instead of "_blank") means every send
+            // from this app re-uses the SAME browser tab instead of opening a
+            // new one each time. Note: this can only re-use a tab that THIS
+            // app itself opened earlier — a website is never allowed (browser
+            // security rule) to detect or re-use a WhatsApp Web/Desktop window
+            // that you opened separately yourself.
+            window.open(`https://wa.me/${digits}?text=${encodeURIComponent(message)}`, 'buildmart_whatsapp_tab');
         }
 
         // Builds a bilingual (English + Marathi) itemised bill message for
@@ -461,34 +467,39 @@
         }
 
         // Tries to share the PDF + message TOGETHER via the phone's native Share
-        // sheet (Web Share API) — on most Android/iPhone browsers this lets the
-        // person pick WhatsApp and the PDF arrives already attached, message
-        // pre-filled as the caption; they just tap Send. This needs no backend
-        // and no paid API — it's a real browser capability, not a workaround.
-        // On desktop browsers that don't support sharing files, it automatically
-        // falls back to: download the PDF + open WhatsApp with the text message
-        // (the old behaviour), since desktop WhatsApp Web has no way to receive
-        // an auto-attached file from a webpage.
+        // sheet (Web Share API) — this genuinely works on most Android/iPhone
+        // browsers: the person picks WhatsApp and the PDF arrives attached.
+        // IMPORTANT HONEST LIMIT: on a computer (WhatsApp Web or the WhatsApp
+        // Desktop app), NO website — not this one, not any other — is allowed
+        // to auto-attach a file into WhatsApp. Only WhatsApp's own 📎 (attach)
+        // button can pick a file from your computer. So on desktop this
+        // function downloads the PDF and opens the exact chat with the message
+        // ready, and tells the person to attach the file themselves.
         async function shareViaWhatsApp(sale, org) {
             const message = buildBillMessage(sale, org);
+            let canFileShare = false;
+            let file = null;
             try {
-                const doc = buildBillPDFDoc(sale, org);
-                const blob = doc.output('blob');
-                const file = new File([blob], `Bill_${sale.id.toString().slice(-6)}.pdf`, { type: 'application/pdf' });
-                if (navigator.canShare && navigator.canShare({ files: [file] })) {
+                const blob = buildBillPDFDoc(sale, org).output('blob');
+                file = new File([blob], `Bill_${sale.id.toString().slice(-6)}.pdf`, { type: 'application/pdf' });
+                canFileShare = !!(navigator.canShare && navigator.canShare({ files: [file] }));
+            } catch (e) { canFileShare = false; }
+
+            if (canFileShare) {
+                try {
                     await navigator.share({ files: [file], text: message, title: 'Bill' });
                     return;
+                } catch (e) {
+                    if (e && e.name === 'AbortError') return; // person cancelled the share sheet — do nothing more
+                    // any other error: fall through to the desktop-style fallback below
                 }
-            } catch (e) {
-                // If the person cancels the share sheet, or sharing fails for any
-                // reason, fall through to the manual-attach fallback below.
-                if (e && e.name === 'AbortError') return; // they just cancelled — don't also open wa.me
             }
-            // Fallback: desktop browsers / unsupported devices.
+
+            alert('Is computer/browser se PDF seedha attach nahi ho sakta (ye sirf mobile ke "Share" button se hota hai). PDF download ho raha hai aur WhatsApp khul raha hai — wahan 📎 (attach) dabakar Downloads folder se file select kar dena.');
             downloadBillPDF(sale, org);
             sendWhatsApp(sale.customer.mobile, message);
-            alert('Aapke browser me seedha attach karke bhejna support nahi hota — PDF download ho gaya hai, WhatsApp me use manually attach kar dena.');
         }
+
 
         function genInviteCode() {
             const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
