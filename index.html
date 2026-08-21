@@ -394,6 +394,152 @@
         };
         function t(lang, key) { return (TRANSLATIONS[lang] && TRANSLATIONS[lang][key]) || TRANSLATIONS.en[key] || key; }
 
+        // Reverses a sale — restores stock, reverses any udhar khata impact, and
+        // marks the sale voided (kept for audit trail, not deleted). Shared by
+        // the "Undo" button right after billing (POS) and "Void" in Sales Report.
+        // Records a line in the Staff Activity Log — a simple audit trail so
+        // the admin can see who changed/deleted/voided what, and when.
+        function logActivity(orgId, userDoc, action, details) {
+            db.collection('orgs').doc(orgId).collection('activityLog').add({
+                action, details: details || '',
+                staffUid: userDoc.uid, staffName: userDoc.name,
+                date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp()
+            }).catch(err => console.error('Activity log failed (non-critical):', err));
+        }
+
+        // Does the actual work of completing a sale — stock deduction, customer
+        // directory update, udhar khata update, due-reminder creation, and
+        // saving the sale document. Shared by (a) normal POS billing and
+        // (b) the admin "Approve" action on a discount that needed sign-off,
+        // so both paths behave identically and stay in sync.
+        async function finalizeSale(orgId, org, input) {
+            const { cart, customer, billType, paymentMode, paymentMethod, subtotal, gstAmount, billDiscountAmt, roundOff, grandTotal, udharPortion, cashAmount, udharSite, udharDueDate, staffUid, staffName, staffEmail, printed, skipCreditCheck } = input;
+
+            const totalProfit = cart.reduce((sum, item) => sum + (item.profit || 0), 0);
+            const saleData = {
+                date: new Date().toISOString(),
+                createdAt: FieldValue.serverTimestamp(),
+                customer, cart, subtotal, gstAmount, billDiscount: billDiscountAmt, roundOff, grandTotal, totalProfit, billType, paymentMode,
+                paymentMethod: cashAmount > 0 ? paymentMethod : null,
+                cashAmount, udharAmount: udharPortion,
+                site: udharPortion > 0 ? (udharSite || '') : '',
+                dueDate: udharPortion > 0 ? (udharDueDate || null) : null,
+                voided: false,
+                returnedTotal: 0, returnedProfit: 0,
+                printed: !!printed,
+                staffUid, staffName, staffEmail
+            };
+
+            let partyRef = null;
+            if (udharPortion > 0) {
+                const partiesRef = db.collection('orgs').doc(orgId).collection('parties');
+                let existing = null;
+                if (customer.mobile) {
+                    const snap = await partiesRef.where('type', '==', 'customer').where('mobile', '==', customer.mobile).limit(1).get();
+                    if (!snap.empty) existing = snap.docs[0];
+                }
+                if (existing && !skipCreditCheck) {
+                    const ed = existing.data();
+                    const limit = ed.creditLimit || 0;
+                    const projectedBalance = (ed.balance || 0) + udharPortion;
+                    if (limit > 0 && projectedBalance > limit) {
+                        const proceed = confirm(`⚠ ${customer.name} ki credit limit ₹${limit.toLocaleString()} hai. Ye sale ke baad balance ₹${projectedBalance.toLocaleString()} ho jayega — limit paar ho rahi hai.\n\nPhir bhi aage badhna hai?`);
+                        if (!proceed) return null;
+                    }
+                }
+                partyRef = existing ? existing.ref : partiesRef.doc();
+            }
+
+            let customerDirRef = null;
+            let isNewCustomer = false;
+            if (customer.name.trim() || customer.mobile.trim()) {
+                const customersRef = db.collection('orgs').doc(orgId).collection('customers');
+                let existingCust = null;
+                if (customer.mobile) {
+                    const custSnap = await customersRef.where('mobile', '==', customer.mobile).limit(1).get();
+                    if (!custSnap.empty) existingCust = custSnap.docs[0];
+                }
+                isNewCustomer = !existingCust;
+                customerDirRef = existingCust ? existingCust.ref : customersRef.doc();
+            }
+
+            const batch = db.batch();
+            cart.forEach(item => {
+                const ref = db.collection('orgs').doc(orgId).collection('products').doc(item.id);
+                batch.update(ref, { stock: FieldValue.increment(-item.qty) });
+            });
+            const saleRef = db.collection('orgs').doc(orgId).collection('sales').doc();
+            batch.set(saleRef, { ...saleData, partyId: partyRef ? partyRef.id : null });
+
+            if (customerDirRef) {
+                const custData = {
+                    name: customer.name || '', mobile: customer.mobile || '', address: customer.address || '',
+                    gst: customer.gst || '',
+                    totalPurchases: FieldValue.increment(1),
+                    totalSpent: FieldValue.increment(grandTotal),
+                    lastPurchaseDate: new Date().toISOString(),
+                    lastBillId: saleRef.id,
+                    createdAt: FieldValue.serverTimestamp()
+                };
+                if (isNewCustomer) custData.firstPurchaseDate = new Date().toISOString();
+                batch.set(customerDirRef, custData, { merge: true });
+            }
+
+            if (partyRef) {
+                batch.set(partyRef, {
+                    name: customer.name, mobile: customer.mobile || '', type: 'customer',
+                    balance: FieldValue.increment(udharPortion),
+                    createdAt: FieldValue.serverTimestamp()
+                }, { merge: true });
+                const txnRef = partyRef.collection('transactions').doc();
+                batch.set(txnRef, {
+                    type: 'sale_credit', amount: udharPortion, site: udharSite || '', dueDate: udharDueDate || null,
+                    note: `Bill #${saleRef.id.slice(-6)}${paymentMode === 'Split' ? ' (part payment)' : ''}`,
+                    billId: saleRef.id, date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp(),
+                    staffUid, staffName
+                });
+                if (udharDueDate) {
+                    batch.set(db.collection('orgs').doc(orgId).collection('dueReminders').doc(), {
+                        partyId: partyRef.id, partyName: customer.name, partyType: 'customer', mobile: customer.mobile || '',
+                        site: udharSite || '', amount: udharPortion, dueDate: udharDueDate,
+                        note: `Bill #${saleRef.id.slice(-6)}`,
+                        resolved: false, createdAt: FieldValue.serverTimestamp()
+                    });
+                }
+            }
+
+            // Sale is ALWAYS saved regardless of whether it's printed. We
+            // deliberately do NOT await the server round-trip — Firestore's
+            // local cache commits immediately (so UI updates right away) and
+            // syncs in the background — this is what keeps billing working
+            // even when the internet is down.
+            batch.commit().catch(err => console.error('Sync error (will retry automatically):', err));
+            return { saleRef, saleData };
+        }
+
+        async function voidSaleGlobal(sale, orgId, staffName) {
+            const batch = db.batch();
+            (sale.cart || []).forEach(item => {
+                const remaining = item.qty - (item.returnedQty || 0);
+                if (remaining > 0) {
+                    batch.update(db.collection('orgs').doc(orgId).collection('products').doc(item.id), { stock: FieldValue.increment(remaining) });
+                }
+            });
+            const remainingUdhar = Math.max(0, (sale.udharAmount || 0) - (sale.returnedTotal || 0));
+            if (sale.partyId && remainingUdhar > 0) {
+                const partyRef = db.collection('orgs').doc(orgId).collection('parties').doc(sale.partyId);
+                batch.update(partyRef, { balance: FieldValue.increment(-remainingUdhar) });
+                batch.set(partyRef.collection('transactions').doc(), {
+                    type: 'payment_received', amount: remainingUdhar, note: `Bill #${sale.id.toString().slice(-6)} voided`,
+                    date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp()
+                });
+            }
+            batch.update(db.collection('orgs').doc(orgId).collection('sales').doc(sale.id), {
+                voided: true, voidedAt: FieldValue.serverTimestamp(), voidedByName: staffName
+            });
+            await batch.commit();
+        }
+
         // Opens WhatsApp (app on phone, WhatsApp Web on desktop) with a message
         // pre-filled for the given number, directly on that customer's chat —
         // no backend/API needed, the staff just taps Send.
@@ -416,24 +562,35 @@
             window.open(`https://wa.me/${digits}?text=${encodeURIComponent(message)}`, 'buildmart_whatsapp_tab');
         }
 
-        // Builds a bilingual (English + Marathi) itemised bill message for
-        // WhatsApp — greeting, material-wise breakdown, and clear payment status.
+        // Builds the bill message for WhatsApp — a full block in English FIRST,
+        // then a full block in Marathi BELOW it (clearly separated), not mixed
+        // word-by-word — easier for either the shop or the customer to read.
         function buildBillMessage(sale, org) {
             const name = sale.customer.name || '';
-            const itemLines = (sale.cart || []).map((it, idx) =>
-                `${idx + 1}. ${it.name} — ${it.qty} ${it.unit} = ₹${it.total.toFixed(2)}`
-            ).join('\n');
             const paidAmt = sale.cashAmount != null ? sale.cashAmount : (sale.grandTotal - (sale.udharAmount || 0));
             const udharAmt = sale.udharAmount || 0;
+            const billNo = sale.id.toString().slice(-6);
+            const dateStr = new Date(sale.date).toLocaleDateString();
 
-            let msg = `🙏 नमस्कार / Namaste ${name}!\n\n`;
-            msg += `*${org.name}* कडून तुमचे बिल / your bill:\nBill #${sale.id.toString().slice(-6)} · ${new Date(sale.date).toLocaleDateString()}\n\n`;
-            msg += `📦 *माल / Items:*\n${itemLines}\n\n`;
-            msg += `💰 एकूण / Total: ₹${sale.grandTotal.toFixed(2)}\n`;
-            if (paidAmt > 0) msg += `✅ जमा / Paid: ₹${paidAmt.toFixed(2)}\n`;
-            if (udharAmt > 0) msg += `🔴 उधार बाकी / Udhar Due: ₹${udharAmt.toFixed(2)}${sale.dueDate ? ` (by ${new Date(sale.dueDate).toLocaleDateString()})` : ''}\n`;
-            msg += `\nधन्यवाद! Thank you for shopping with us! 🙏\n${org.name}${org.mobile ? ' · ' + org.mobile : ''}`;
-            return msg;
+            const itemLinesEn = (sale.cart || []).map((it, idx) => `${idx + 1}. ${it.name} — ${it.qty} ${it.unit} = ₹${it.total.toFixed(2)}`).join('\n');
+
+            let en = `🙏 Namaste ${name}!\n\n`;
+            en += `*${org.name}* — your bill #${billNo}, ${dateStr}\n\n`;
+            en += `📦 Items:\n${itemLinesEn}\n\n`;
+            en += `💰 Total: ₹${sale.grandTotal.toFixed(2)}\n`;
+            if (paidAmt > 0) en += `✅ Paid: ₹${paidAmt.toFixed(2)}\n`;
+            if (udharAmt > 0) en += `🔴 Udhar Due: ₹${udharAmt.toFixed(2)}${sale.dueDate ? ` (by ${new Date(sale.dueDate).toLocaleDateString()})` : ''}\n`;
+            en += `\nThank you for shopping with us! 🙏\n${org.name}${org.mobile ? ' · ' + org.mobile : ''}`;
+
+            let mr = `🙏 नमस्कार ${name}!\n\n`;
+            mr += `*${org.name}* — तुमचे बिल #${billNo}, ${dateStr}\n\n`;
+            mr += `📦 वस्तू:\n${itemLinesEn}\n\n`;
+            mr += `💰 एकूण: ₹${sale.grandTotal.toFixed(2)}\n`;
+            if (paidAmt > 0) mr += `✅ जमा: ₹${paidAmt.toFixed(2)}\n`;
+            if (udharAmt > 0) mr += `🔴 उधार बाकी: ₹${udharAmt.toFixed(2)}${sale.dueDate ? ` (${new Date(sale.dueDate).toLocaleDateString()} पर्यंत)` : ''}\n`;
+            mr += `\nधन्यवाद! आमच्याकडून खरेदी केल्याबद्दल आभारी आहोत 🙏\n${org.name}${org.mobile ? ' · ' + org.mobile : ''}`;
+
+            return `${en}\n\n— — — — —\n\n${mr}`;
         }
 
         // Builds the bill PDF document (jsPDF object) — shared by both the plain
@@ -466,36 +623,18 @@
             buildBillPDFDoc(sale, org).save(`Bill_${sale.id.toString().slice(-6)}.pdf`);
         }
 
-        // Tries to share the PDF + message TOGETHER via the phone's native Share
-        // sheet (Web Share API) — this genuinely works on most Android/iPhone
-        // browsers: the person picks WhatsApp and the PDF arrives attached.
-        // IMPORTANT HONEST LIMIT: on a computer (WhatsApp Web or the WhatsApp
-        // Desktop app), NO website — not this one, not any other — is allowed
-        // to auto-attach a file into WhatsApp. Only WhatsApp's own 📎 (attach)
-        // button can pick a file from your computer. So on desktop this
-        // function downloads the PDF and opens the exact chat with the message
-        // ready, and tells the person to attach the file themselves.
-        async function shareViaWhatsApp(sale, org) {
-            const message = buildBillMessage(sale, org);
-            let canFileShare = false;
-            let file = null;
-            try {
-                const blob = buildBillPDFDoc(sale, org).output('blob');
-                file = new File([blob], `Bill_${sale.id.toString().slice(-6)}.pdf`, { type: 'application/pdf' });
-                canFileShare = !!(navigator.canShare && navigator.canShare({ files: [file] }));
-            } catch (e) { canFileShare = false; }
-
-            if (canFileShare) {
-                try {
-                    await navigator.share({ files: [file], text: message, title: 'Bill' });
-                    return;
-                } catch (e) {
-                    if (e && e.name === 'AbortError') return; // person cancelled the share sheet — do nothing more
-                    // any other error: fall through to the desktop-style fallback below
-                }
-            }
-
-            alert('Is computer/browser se PDF seedha attach nahi ho sakta (ye sirf mobile ke "Share" button se hota hai). PDF download ho raha hai aur WhatsApp khul raha hai — wahan 📎 (attach) dabakar Downloads folder se file select kar dena.');
+        // IMPORTANT HONEST LIMIT (confirmed by real testing): trying to "auto
+        // target a specific WhatsApp number" while also attaching a file does
+        // NOT reliably work — the phone's Share sheet hands control to
+        // WhatsApp's own contact picker, which usually can't be pre-aimed at a
+        // number unless it's already saved as a phone contact. That's a
+        // WhatsApp/OS limitation, not something any website can fix.
+        // So instead we always use the ONE thing that reliably works: open the
+        // EXACT chat via wa.me (same as the plain "Send via WhatsApp" button),
+        // and separately download the PDF so it can be attached with one tap
+        // on the 📎 already sitting right there in that chat.
+        function shareViaWhatsApp(sale, org) {
+            const message = buildBillMessage(sale, org) + '\n\n📎 PDF neeche Downloads/Files me hai — 📎 (attach) dabakar yahi chat me bhej dena.';
             downloadBillPDF(sale, org);
             sendWhatsApp(sale.customer.mobile, message);
         }
@@ -708,7 +847,7 @@
         // ============================================================
         // 4. DASHBOARD
         // ============================================================
-        const Dashboard = ({ sales, products, lang }) => {
+        const Dashboard = ({ sales, products, lang, org, isAdmin }) => {
             const [filter, setFilter] = useState({ from: '', to: '' });
             const [notifPermission, setNotifPermission] = useState(typeof Notification !== 'undefined' ? Notification.permission : 'unsupported');
 
@@ -880,8 +1019,29 @@
                 Notification.requestPermission().then(p => setNotifPermission(p));
             };
 
+            // Weekly backup reminder — since there's no backend to run a
+            // scheduled job, we simply check the last backup date (stored on the
+            // org doc when "Download Full Backup" is used) whenever an admin
+            // opens the Dashboard, and nudge them if it's been over 7 days.
+            const daysSinceBackup = org && org.lastBackupDate ? Math.floor((Date.now() - new Date(org.lastBackupDate).getTime()) / 86400000) : null;
+            const needsBackupReminder = isAdmin && (daysSinceBackup === null || daysSinceBackup >= 7);
+
+            const sendLowStockToWhatsApp = () => {
+                if (!org.ownerWhatsapp) { alert('Pehle Settings me apna WhatsApp number daalo ("Owner WhatsApp Number").'); return; }
+                const list = stats.lowStockItems.slice(0, 30).map((p, i) => `${i + 1}. ${p.name} — ${p.stock} ${p.unit}`).join('\n');
+                const msg = `⚠ Low Stock Alert — ${org.name}\n\n${list}${stats.lowStockItems.length > 30 ? `\n...aur ${stats.lowStockItems.length - 30} items` : ''}`;
+                sendWhatsApp(org.ownerWhatsapp, msg);
+            };
+
             return (
                 <div className="p-6 overflow-auto">
+                    {needsBackupReminder && (
+                        <div className="mb-4 bg-yellow-50 border border-yellow-300 rounded p-3 flex justify-between items-center flex-wrap gap-2">
+                            <p className="text-sm text-yellow-800">
+                                📦 {daysSinceBackup === null ? 'Aapne kabhi backup nahi liya' : `Aapne ${daysSinceBackup} din se backup nahi liya`} — data safe rakhne ke liye Settings se backup le lo.
+                            </p>
+                        </div>
+                    )}
                     <div className="flex flex-wrap justify-between items-end gap-4 mb-6">
                         <h2 className="text-2xl font-bold">Business Overview</h2>
                         <div className="flex gap-2 items-end">
@@ -946,7 +1106,10 @@
                         <div className="bg-white rounded shadow overflow-hidden">
                             <div className="p-3 bg-gray-50 border-b font-bold text-red-600 flex justify-between items-center">
                                 <span>⚠ Low Stock Alert (&lt; 10)</span>
-                                {stats.lowStockItems.length > 0 && <button onClick={openPO} className="text-xs bg-orange-600 text-white px-2 py-1 rounded font-bold">📝 Purchase Order</button>}
+                                <div className="flex gap-1">
+                                    {stats.lowStockItems.length > 0 && isAdmin && <button onClick={sendLowStockToWhatsApp} className="text-xs bg-green-600 text-white px-2 py-1 rounded font-bold">📱 WhatsApp</button>}
+                                    {stats.lowStockItems.length > 0 && <button onClick={openPO} className="text-xs bg-orange-600 text-white px-2 py-1 rounded font-bold">📝 Purchase Order</button>}
+                                </div>
                             </div>
                             <div className="max-h-80 overflow-auto">
                                 {stats.lowStockItems.map(p => (
@@ -1029,7 +1192,7 @@
         const GST_SLABS = [0, 5, 12, 18, 28];
 
         const Inventory = ({ orgId, products, isAdmin, lang, userDoc }) => {
-            const [form, setForm] = useState({ name: '', category: 'Hardware', unit: 'Pcs', priceBuy: '', priceSell: '', priceWholesale: '', stock: '', gstApplicable: true, gst: 18, discountAllowed: true, discount: 0, brand: '', spec: '', barcode: '', hsnCode: '', purchaseUnit: '', conversionFactor: 1 });
+            const [form, setForm] = useState({ name: '', category: 'Hardware', unit: 'Pcs', priceBuy: '', priceSell: '', priceWholesale: '', stock: '', gstApplicable: true, gst: 18, discountAllowed: true, discount: 0, brand: '', spec: '', barcode: '', hsnCode: '', purchaseUnit: '', conversionFactor: 1, isVolatile: false });
             const [search, setSearch] = useState('');
             const [suggestions, setSuggestions] = useState([]);
             const [restockProd, setRestockProd] = useState(null); // set when an existing product is picked
@@ -1037,24 +1200,38 @@
             const [purchaseMode, setPurchaseMode] = useState('Cash'); // Cash | Udhar (admin only, tracks supplier khata)
             const [purchaseGstIncluded, setPurchaseGstIncluded] = useState(false); // is GST already included in Purchase Rate?
             const [purchaseDueDate, setPurchaseDueDate] = useState(''); // when supplier payment is due (Udhar purchases)
+            const [transportCharge, setTransportCharge] = useState(''); // gadi bhada / freight — logged as a Transport expense automatically
             const [quickBase, setQuickBase] = useState(''); // base item picked from catalog, e.g. "TMT Steel Bar"
             const [importBusy, setImportBusy] = useState(false);
             const [importMsg, setImportMsg] = useState('');
             const [labelSelection, setLabelSelection] = useState({}); // productId -> qty of labels to print
+            const [priceHistoryProd, setPriceHistoryProd] = useState(null);
+            const [quickRates, setQuickRates] = useState({}); // productId -> new rate (for volatile items)
+            const [quickRateBusy, setQuickRateBusy] = useState(false);
+            const [priceHistoryData, setPriceHistoryData] = useState([]);
             const nameRef = useRef();
             const importFileRef = useRef();
 
             const productsRef = db.collection('orgs').doc(orgId).collection('products');
             const catalogEntry = CATALOG[form.category];
 
+            useEffect(() => {
+                if (!priceHistoryProd) { setPriceHistoryData([]); return; }
+                const unsub = productsRef.doc(priceHistoryProd.id).collection('priceHistory').orderBy('createdAt', 'desc').onSnapshot(snap => {
+                    setPriceHistoryData(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+                });
+                return unsub;
+            }, [priceHistoryProd]);
+
             const resetForm = () => {
-                setForm({ name: '', category: 'Hardware', unit: 'Pcs', priceBuy: '', priceSell: '', priceWholesale: '', stock: '', gstApplicable: true, gst: 18, discountAllowed: true, discount: 0, brand: '', spec: '', barcode: '', hsnCode: '', purchaseUnit: '', conversionFactor: 1 });
+                setForm({ name: '', category: 'Hardware', unit: 'Pcs', priceBuy: '', priceSell: '', priceWholesale: '', stock: '', gstApplicable: true, gst: 18, discountAllowed: true, discount: 0, brand: '', spec: '', barcode: '', hsnCode: '', purchaseUnit: '', conversionFactor: 1, isVolatile: false });
                 setRestockProd(null);
                 setSuggestions([]);
                 setSupplier({ name: '', mobile: '' });
                 setPurchaseMode('Cash');
                 setPurchaseGstIncluded(false);
                 setPurchaseDueDate('');
+                setTransportCharge('');
                 setQuickBase('');
             };
 
@@ -1095,7 +1272,7 @@
                     name: p.name, category: p.category, unit: p.unit,
                     priceBuy: p.priceBuy, priceSell: p.priceSell, priceWholesale: p.priceWholesale || '',
                     stock: '', gstApplicable: p.gstApplicable !== false, gst: p.gst, discountAllowed: p.discountAllowed !== false, discount: p.discount,
-                    brand: p.brand || '', spec: p.spec || '', barcode: p.barcode || ''
+                    brand: p.brand || '', spec: p.spec || '', barcode: p.barcode || '', hsnCode: p.hsnCode || '', purchaseUnit: '', conversionFactor: 1, isVolatile: !!p.isVolatile
                 });
                 setRestockProd(p);
                 setSuggestions([]);
@@ -1141,14 +1318,26 @@
                         priceBuy: buyRate, priceSell: Number(form.priceSell), priceWholesale: form.priceWholesale ? Number(form.priceWholesale) : FieldValue.delete(),
                         gstApplicable: !!form.gstApplicable, gst: gstPct,
                         discountAllowed: !!form.discountAllowed, discount: form.discountAllowed ? (Number(form.discount) || 0) : 0,
+                        isVolatile: !!form.isVolatile,
                         stock: FieldValue.increment(stockQty)
                     });
+                    // Record a price-change history entry only when the rate
+                    // actually changed on this restock — lets the admin see
+                    // when/who changed a product's rate and what it used to be.
+                    if (restockProd.priceSell !== Number(form.priceSell) || restockProd.priceBuy !== buyRate) {
+                        batch.set(productRef.collection('priceHistory').doc(), {
+                            oldSell: restockProd.priceSell, newSell: Number(form.priceSell),
+                            oldBuy: restockProd.priceBuy, newBuy: buyRate,
+                            changedBy: userDoc.name, date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp()
+                        });
+                    }
                 } else {
                     batch.set(productRef, {
                         name: form.name, category: form.category, unit: form.unit, brand: form.brand || '', spec: form.spec || '', barcode: form.barcode || '', hsnCode: form.hsnCode || '',
                         priceBuy: buyRate, priceSell: Number(form.priceSell), priceWholesale: form.priceWholesale ? Number(form.priceWholesale) : null,
                         stock: stockQty, gstApplicable: !!form.gstApplicable, gst: gstPct,
                         discountAllowed: !!form.discountAllowed, discount: form.discountAllowed ? (Number(form.discount) || 0) : 0,
+                        isVolatile: !!form.isVolatile,
                         createdAt: FieldValue.serverTimestamp()
                     });
                 }
@@ -1184,8 +1373,21 @@
                         productId: productRef.id, productName: form.name, category: form.category,
                         qty: stockQty, rate: buyRate, gstAmount: purchaseGstAmt, total: purchaseTotal,
                         paymentMode: purchaseMode, supplierName: purchaseMode === 'Udhar' ? supplier.name : '',
+                        transportCharge: Number(transportCharge) || 0,
                         date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp(),
                         staffName: userDoc.name
+                    });
+                }
+
+                // Gadi bhada / freight — logged straight into Expenses (Transport/
+                // Loading category) so it correctly reduces profit in the P&L,
+                // even though it's usually paid to the driver, not the supplier.
+                const freight = Number(transportCharge) || 0;
+                if (freight > 0) {
+                    batch.set(db.collection('orgs').doc(orgId).collection('expenses').doc(), {
+                        category: 'Transport/Loading', amount: freight,
+                        note: `Gadi bhada — ${form.name} x ${enteredQty} ${form.purchaseUnit || form.unit}${supplier.name ? ' from ' + supplier.name : ''}`,
+                        date: new Date().toISOString().split('T')[0], createdAt: FieldValue.serverTimestamp()
                     });
                 }
 
@@ -1196,7 +1398,44 @@
 
             const handleDelete = async (id) => {
                 if (!isAdmin) return alert('Access Denied');
-                if (confirm('Delete product?')) await productsRef.doc(id).delete();
+                const prod = products.find(p => p.id === id);
+                if (confirm('Delete product?')) {
+                    await productsRef.doc(id).delete();
+                    logActivity(orgId, userDoc, 'Product Deleted', prod ? prod.name : id);
+                }
+            };
+
+            // ------- ⚡ Quick Rate Update (for Steel/Cement/Paint — items whose
+            // rate is tied to daily market prices) — updates just the sell rate
+            // for several products in one go, without touching stock, and still
+            // logs each change into Price History like a normal rate edit does.
+            const submitQuickRates = async () => {
+                const changed = Object.entries(quickRates).filter(([, val]) => val !== '' && val != null);
+                if (changed.length === 0) { alert('Koi naya rate nahi daala.'); return; }
+                setQuickRateBusy(true);
+                try {
+                    const batch = db.batch();
+                    changed.forEach(([id, val]) => {
+                        const prod = products.find(p => p.id === id);
+                        if (!prod) return;
+                        const newSell = Number(val);
+                        if (!newSell || newSell === prod.priceSell) return;
+                        batch.update(productsRef.doc(id), { priceSell: newSell });
+                        batch.set(productsRef.doc(id).collection('priceHistory').doc(), {
+                            oldSell: prod.priceSell, newSell,
+                            oldBuy: prod.priceBuy, newBuy: prod.priceBuy,
+                            changedBy: userDoc.name, date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp()
+                        });
+                    });
+                    await batch.commit();
+                    logActivity(orgId, userDoc, 'Quick Rate Update', `${changed.length} products ka rate update kiya`);
+                    setQuickRates({});
+                    alert('Rates update ho gaye!');
+                } catch (e) {
+                    alert('Error: ' + e.message);
+                } finally {
+                    setQuickRateBusy(false);
+                }
             };
 
             const downloadImportTemplate = () => {
@@ -1334,6 +1573,29 @@
 
             return (
                 <div className="p-4 h-full overflow-auto">
+                    {products.some(p => p.isVolatile) && (
+                        <div className="bg-orange-50 border-2 border-orange-300 rounded p-4 mb-6">
+                            <h3 className="font-bold text-orange-800 mb-1">⚡ Aaj Ka Rate Update — Steel/Cement jaise items</h3>
+                            <p className="text-xs text-orange-700 mb-3">Roz subah in items ka naya rate daal do — sirf rate badlega, stock jaisa hai waisa rahega.</p>
+                            <div className="space-y-2 mb-3">
+                                {products.filter(p => p.isVolatile).map(p => (
+                                    <div key={p.id} className="flex justify-between items-center bg-white p-2 rounded">
+                                        <div>
+                                            <div className="font-bold text-sm">{p.name}</div>
+                                            <div className="text-xs text-gray-500">Abhi ka rate: ₹{p.priceSell}</div>
+                                        </div>
+                                        <input type="number" className="border-2 border-orange-300 rounded p-1 w-28 text-center font-bold"
+                                            placeholder="Naya Rate ₹" value={quickRates[p.id] || ''}
+                                            onChange={e => setQuickRates({ ...quickRates, [p.id]: e.target.value })} />
+                                    </div>
+                                ))}
+                            </div>
+                            <button onClick={submitQuickRates} disabled={quickRateBusy} className="bg-orange-600 text-white px-4 py-2 rounded font-bold disabled:opacity-50">
+                                {quickRateBusy ? 'Update ho raha hai...' : 'Sab Rate Update Karo'}
+                            </button>
+                            <p className="text-xs text-gray-400 mt-2">Naye item ko "⚡ Rate Roz Badalta Hai?" checkbox se yahan add karo (neeche "Add New Material" form mein).</p>
+                        </div>
+                    )}
                     <div className="bg-white p-4 rounded shadow mb-6">
                         <div className="flex justify-between items-center mb-2">
                             <h3 className="font-bold">{restockProd ? `${t(lang, 'inv_restocking')}: ${restockProd.name}` : t(lang, 'inv_addNew')}</h3>
@@ -1453,6 +1715,11 @@
                                     <input type="number" placeholder="Default Disc %" className="border p-1 rounded text-sm w-28" value={form.discount} onChange={e => setForm({ ...form, discount: e.target.value })} />
                                 )}
                                 {!form.discountAllowed && <span className="text-xs text-gray-400">Fixed Rate — Koi Discount Nahi</span>}
+
+                                <label className="flex items-center gap-2 text-sm cursor-pointer ml-4">
+                                    <input type="checkbox" checked={form.isVolatile} onChange={e => setForm({ ...form, isVolatile: e.target.checked })} />
+                                    <span className="font-bold">⚡ Rate Roz Badalta Hai? (Steel/Cement)</span>
+                                </label>
                             </div>
 
                             <input placeholder="Barcode (optional, scan karo)" className="border p-2 rounded" value={form.barcode} onChange={e => setForm({ ...form, barcode: e.target.value })} />
@@ -1481,7 +1748,14 @@
                                             </div>
                                         </>
                                     )}
+                                    <div>
+                                        <label className="text-xs text-gray-500 block">🚚 Gadi Bhada / Freight ₹ (optional)</label>
+                                        <input type="number" min="0" className="border p-1 rounded text-sm w-32" placeholder="0" value={transportCharge} onChange={e => setTransportCharge(e.target.value)} />
+                                    </div>
                                 </div>
+                                {Number(transportCharge) > 0 && (
+                                    <p className="text-xs text-orange-600 mt-1">₹{Number(transportCharge).toLocaleString()} ka gadi bhada Expenses (Transport/Loading) mein automatically add ho jayega — P&L mein sahi se ginega.</p>
+                                )}
 
                                 {Number(form.priceBuy) > 0 && (() => {
                                     const qty = Number(form.stock) || 0;
@@ -1575,13 +1849,37 @@
                                             {p.gstApplicable === false ? <span className="text-xs bg-gray-100 text-gray-500 px-2 py-0.5 rounded">No GST</span> : <span className="text-xs bg-blue-100 text-blue-700 px-2 py-0.5 rounded font-bold">{p.gst || 0}%</span>}
                                         </td>
                                         <td className="p-2">{p.discountAllowed === false ? <span className="text-xs text-gray-400">Fixed</span> : `${p.discount}%`}</td>
-                                        <td className="p-2">{isAdmin && <button onClick={() => handleDelete(p.id)} className="text-red-500 hover:text-red-700">{t(lang, 'inv_delete')}</button>}</td>
+                                        <td className="p-2 whitespace-nowrap">
+                                            <button onClick={() => setPriceHistoryProd(p)} className="text-blue-500 hover:text-blue-700 mr-2" title="Price History">📈</button>
+                                            {isAdmin && <button onClick={() => handleDelete(p.id)} className="text-red-500 hover:text-red-700">{t(lang, 'inv_delete')}</button>}
+                                        </td>
                                     </tr>
                                 ))}
                             </tbody>
                         </table>
                         {isAdmin && <p className="text-xs text-gray-400 p-2">"Labels" column me kitne barcode sticker print karne hain wo quantity daalo, phir upar "Print Barcode Labels" dabao.</p>}
                     </div>
+
+                    {priceHistoryProd && (
+                        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+                            <div className="bg-white rounded shadow-xl w-full max-w-md max-h-[80vh] flex flex-col">
+                                <div className="p-4 border-b flex justify-between items-center">
+                                    <h3 className="font-bold">Price History — {priceHistoryProd.name}</h3>
+                                    <button onClick={() => setPriceHistoryProd(null)} className="text-gray-400 text-xl">&times;</button>
+                                </div>
+                                <div className="flex-1 overflow-auto p-4 space-y-2">
+                                    {priceHistoryData.map(h => (
+                                        <div key={h.id} className="border-b pb-2 text-sm">
+                                            <div className="text-xs text-gray-400">{new Date(h.date).toLocaleString()} · {h.changedBy}</div>
+                                            <div>Sell Rate: <span className="line-through text-gray-400">₹{h.oldSell}</span> → <span className="font-bold text-blue-700">₹{h.newSell}</span></div>
+                                            {h.oldBuy !== h.newBuy && <div>Purchase Rate: <span className="line-through text-gray-400">₹{h.oldBuy}</span> → <span className="font-bold">₹{h.newBuy}</span></div>}
+                                        </div>
+                                    ))}
+                                    {priceHistoryData.length === 0 && <p className="text-center text-gray-400 text-sm">Is product ka rate abhi tak kabhi badla nahi.</p>}
+                                </div>
+                            </div>
+                        </div>
+                    )}
                 </div>
             );
         };
@@ -1613,6 +1911,14 @@
             const [saving, setSaving] = useState(false);
             const [heldBills, setHeldBills] = useState([]);
             const [showHeld, setShowHeld] = useState(false);
+            const [bookings, setBookings] = useState([]);
+            const [showBookings, setShowBookings] = useState(false);
+            const [showBookingForm, setShowBookingForm] = useState(false);
+            const [bookingAdvance, setBookingAdvance] = useState('');
+            const [recurringOrders, setRecurringOrders] = useState([]);
+            const [showRecurring, setShowRecurring] = useState(false);
+            const [showSaveRecurring, setShowSaveRecurring] = useState(false);
+            const [recurringLabel, setRecurringLabel] = useState('');
             const [lastSale, setLastSale] = useState(null); // for "Send via WhatsApp" right after billing
 
             const searchRef = useRef();
@@ -1660,6 +1966,20 @@
             }, [orgId]);
 
             useEffect(() => {
+                const unsub = db.collection('orgs').doc(orgId).collection('bookings').where('status', '==', 'pending').onSnapshot(snap => {
+                    setBookings(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+                });
+                return unsub;
+            }, [orgId]);
+
+            useEffect(() => {
+                const unsub = db.collection('orgs').doc(orgId).collection('recurringOrders').orderBy('createdAt', 'desc').onSnapshot(snap => {
+                    setRecurringOrders(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+                });
+                return unsub;
+            }, [orgId]);
+
+            useEffect(() => {
                 const handleKey = (e) => {
                     if (e.key === 'F2') { e.preventDefault(); searchRef.current && searchRef.current.focus(); }
                     if (e.key === 'F9') { e.preventDefault(); completeSale(true); }
@@ -1692,6 +2012,67 @@
             const discardHeldBill = async (h) => {
                 if (confirm(`"${h.label}" wala held bill delete karna hai?`)) {
                     await db.collection('orgs').doc(orgId).collection('heldBills').doc(h.id).delete();
+                }
+            };
+
+            // ------- Advance / Token Booking -------
+            // For when a customer pays some money NOW to reserve material, but
+            // takes actual delivery later. Unlike a normal sale, stock is NOT
+            // deducted at booking time — only when the booking is later
+            // converted into a real bill (at which point it behaves exactly
+            // like a normal sale, with the advance already adjusted in).
+            const createBooking = async () => {
+                if (cart.length === 0) return alert('Cart khaali hai, booking ke liye items add karo.');
+                if (!customer.name.trim()) return alert('Booking ke liye customer ka naam zaroori hai.');
+                const advance = Number(bookingAdvance) || 0;
+                await db.collection('orgs').doc(orgId).collection('bookings').add({
+                    cart, customer, billType, advanceAmount: advance,
+                    status: 'pending', label: customer.name, staffName: userDoc.name,
+                    createdAt: FieldValue.serverTimestamp()
+                });
+                logActivity(orgId, userDoc, 'Advance Booking Created', `${customer.name} — Advance ₹${advance}`);
+                setCart([]); setCustomer({ name: '', mobile: '', gst: '', address: '' }); setBillDiscount(''); setBookingAdvance(''); setShowBookingForm(false);
+            };
+
+            const convertBookingToBill = async (b) => {
+                setCart(b.cart || []);
+                setCustomer(b.customer || { name: '', mobile: '', gst: '', address: '' });
+                setBillType(b.billType || 'Estimate');
+                setBillDiscount(b.advanceAmount > 0 ? String(b.advanceAmount) : '');
+                await db.collection('orgs').doc(orgId).collection('bookings').doc(b.id).delete();
+                setShowBookings(false);
+                if (b.advanceAmount > 0) alert(`Advance ₹${b.advanceAmount} already mila tha — wo bill discount me adjust ho gaya hai. Baki amount collect karke bill complete karo.`);
+            };
+
+            const cancelBooking = async (b) => {
+                if (confirm(`"${b.label}" ki booking cancel karni hai? (Advance refund manually handle karna hoga)`)) {
+                    await db.collection('orgs').doc(orgId).collection('bookings').doc(b.id).delete();
+                    logActivity(orgId, userDoc, 'Booking Cancelled', b.label);
+                }
+            };
+
+            // ------- Recurring Orders (customer jo har mahine same items mangwata hai) -------
+            const saveRecurringOrder = async () => {
+                if (cart.length === 0) return alert('Cart khaali hai.');
+                if (!recurringLabel.trim()) return alert('Order ka naam do (jaise "Ramesh Contractor - Monthly").');
+                await db.collection('orgs').doc(orgId).collection('recurringOrders').add({
+                    label: recurringLabel.trim(), cart, customer, billType,
+                    createdBy: userDoc.name, createdAt: FieldValue.serverTimestamp()
+                });
+                setRecurringLabel(''); setShowSaveRecurring(false);
+                alert('Recurring order save ho gaya! Agli baar "🔁 Recurring Orders" se ek click me load kar sakte ho.');
+            };
+
+            const useRecurringOrder = (r) => {
+                setCart(r.cart || []);
+                setCustomer(r.customer || { name: '', mobile: '', gst: '', address: '' });
+                setBillType(r.billType || 'Estimate');
+                setShowRecurring(false);
+            };
+
+            const deleteRecurringOrder = async (r) => {
+                if (confirm(`"${r.label}" template delete karna hai?`)) {
+                    await db.collection('orgs').doc(orgId).collection('recurringOrders').doc(r.id).delete();
                 }
             };
 
@@ -1791,116 +2172,39 @@
                 setSaving(true);
                 try {
                     const cashAmount = grandTotal - udharPortion;
-                    const totalProfit = cart.reduce((sum, item) => sum + (item.profit || 0), 0);
-                    const saleData = {
-                        date: new Date().toISOString(),
-                        createdAt: FieldValue.serverTimestamp(),
-                        customer, cart, subtotal, gstAmount, billDiscount: billDiscountAmt, roundOff, grandTotal, totalProfit, billType, paymentMode,
-                        paymentMethod: cashAmount > 0 ? paymentMethod : null,
-                        cashAmount, udharAmount: udharPortion,
-                        site: udharPortion > 0 ? (udharSite || '') : '',
-                        dueDate: udharPortion > 0 ? (udharDueDate || null) : null,
-                        voided: false,
-                        returnedTotal: 0, returnedProfit: 0,
-                        printed: shouldPrint,
-                        staffUid: firebaseUser.uid,
-                        staffName: userDoc.name,
-                        staffEmail: userDoc.email
-                    };
 
-                    // If any part of this sale is on credit (Udhar or the udhar-half of
-                    // a Split payment), find-or-create the customer's khata party.
-                    let partyRef = null;
-                    if (udharPortion > 0) {
-                        const partiesRef = db.collection('orgs').doc(orgId).collection('parties');
-                        let existing = null;
-                        if (customer.mobile) {
-                            const snap = await partiesRef.where('type', '==', 'customer').where('mobile', '==', customer.mobile).limit(1).get();
-                            if (!snap.empty) existing = snap.docs[0];
-                        }
-                        // Credit limit check: if this customer already has a limit set
-                        // and this sale would push them over it, warn before proceeding.
-                        if (existing) {
-                            const ed = existing.data();
-                            const limit = ed.creditLimit || 0;
-                            const projectedBalance = (ed.balance || 0) + udharPortion;
-                            if (limit > 0 && projectedBalance > limit) {
-                                const proceed = confirm(`⚠ ${customer.name} ki credit limit ₹${limit.toLocaleString()} hai. Ye sale ke baad balance ₹${projectedBalance.toLocaleString()} ho jayega — limit paar ho rahi hai.\n\nPhir bhi aage badhna hai?`);
-                                if (!proceed) { setSaving(false); return; }
-                            }
-                        }
-                        partyRef = existing ? existing.ref : partiesRef.doc();
-                    }
+                    // Discount-approval gate: if the shop owner has set a max
+                    // discount % that staff can give on their own, and this bill
+                    // exceeds it, send it to the admin for approval instead of
+                    // completing it immediately (admins always bypass this).
+                    const isAdminUser = userDoc.role === 'owner' || userDoc.role === 'admin';
+                    const maxItemPct = cart.reduce((max, item) => (item.discountType === 'percent' && item.discount > max) ? item.discount : max, 0);
+                    const billPct = (subtotal + gstAmount) > 0 ? (billDiscountAmt / (subtotal + gstAmount)) * 100 : 0;
+                    const effectiveDiscountPct = Math.max(maxItemPct, billPct);
 
-                    // Every sale with a customer name/mobile updates a permanent
-                    // Customer Directory — separate from the Udhar Khata (which is
-                    // only for people who owe money). This directory keeps EVERY
-                    // customer (cash or credit) for future reference/marketing.
-                    let customerDirRef = null;
-                    let isNewCustomer = false;
-                    if (customer.name.trim() || customer.mobile.trim()) {
-                        const customersRef = db.collection('orgs').doc(orgId).collection('customers');
-                        let existingCust = null;
-                        if (customer.mobile) {
-                            const custSnap = await customersRef.where('mobile', '==', customer.mobile).limit(1).get();
-                            if (!custSnap.empty) existingCust = custSnap.docs[0];
-                        }
-                        isNewCustomer = !existingCust;
-                        customerDirRef = existingCust ? existingCust.ref : customersRef.doc();
-                    }
-
-                    const batch = db.batch();
-                    cart.forEach(item => {
-                        const ref = db.collection('orgs').doc(orgId).collection('products').doc(item.id);
-                        batch.update(ref, { stock: FieldValue.increment(-item.qty) });
-                    });
-                    const saleRef = db.collection('orgs').doc(orgId).collection('sales').doc();
-                    batch.set(saleRef, { ...saleData, partyId: partyRef ? partyRef.id : null });
-
-                    if (customerDirRef) {
-                        const custData = {
-                            name: customer.name || '', mobile: customer.mobile || '', address: customer.address || '',
-                            gst: customer.gst || '',
-                            totalPurchases: FieldValue.increment(1),
-                            totalSpent: FieldValue.increment(grandTotal),
-                            lastPurchaseDate: new Date().toISOString(),
-                            lastBillId: saleRef.id,
-                            createdAt: FieldValue.serverTimestamp()
-                        };
-                        if (isNewCustomer) custData.firstPurchaseDate = new Date().toISOString();
-                        batch.set(customerDirRef, custData, { merge: true });
-                    }
-
-                    if (partyRef) {
-                        batch.set(partyRef, {
-                            name: customer.name, mobile: customer.mobile || '', type: 'customer',
-                            balance: FieldValue.increment(udharPortion),
-                            createdAt: FieldValue.serverTimestamp()
-                        }, { merge: true });
-                        const txnRef = partyRef.collection('transactions').doc();
-                        batch.set(txnRef, {
-                            type: 'sale_credit', amount: udharPortion, site: udharSite || '', dueDate: udharDueDate || null,
-                            note: `Bill #${saleRef.id.slice(-6)}${paymentMode === 'Split' ? ' (part payment)' : ''}`,
-                            billId: saleRef.id, date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp(),
-                            staffUid: firebaseUser.uid, staffName: userDoc.name
+                    if (org.maxDiscountPct != null && !isAdminUser && effectiveDiscountPct > org.maxDiscountPct) {
+                        await db.collection('orgs').doc(orgId).collection('pendingApprovals').add({
+                            cart, customer, billType, paymentMode, paymentMethod,
+                            subtotal, gstAmount, billDiscountAmt, roundOff, grandTotal, udharPortion, cashAmount,
+                            udharSite, udharDueDate, discountPct: effectiveDiscountPct,
+                            requestedByUid: firebaseUser.uid, requestedByName: userDoc.name, requestedByEmail: userDoc.email,
+                            status: 'pending', createdAt: FieldValue.serverTimestamp()
                         });
-                        if (udharDueDate) {
-                            batch.set(db.collection('orgs').doc(orgId).collection('dueReminders').doc(), {
-                                partyId: partyRef.id, partyName: customer.name, partyType: 'customer', mobile: customer.mobile || '',
-                                site: udharSite || '', amount: udharPortion, dueDate: udharDueDate,
-                                note: `Bill #${saleRef.id.slice(-6)}`,
-                                resolved: false, createdAt: FieldValue.serverTimestamp()
-                            });
-                        }
+                        alert(`Ye discount (${effectiveDiscountPct.toFixed(1)}%) admin ki approval-limit (${org.maxDiscountPct}%) se zyada hai. Bill admin ke paas approval ke liye bhej diya gaya hai — approve hote hi complete ho jayega.`);
+                        setCart([]); setCustomer({ name: '', mobile: '', gst: '', address: '' }); setQuery(''); setExistingCustomerInfo(null);
+                        setPaymentMode('Cash'); setPaymentMethod('Cash'); setSplitCash(''); setUdharSite(''); setUdharDueDate(''); setBillDiscount('');
+                        return;
                     }
 
-                    // Sale is ALWAYS saved to Firestore regardless of whether it's printed —
-                    // printing is just an optional extra step on top. We deliberately do
-                    // NOT await the server round-trip here: Firestore's local cache commits
-                    // the write immediately (so stock/cart update right away) and syncs to
-                    // the server in the background — this is what keeps billing working
-                    // even when the internet is down.
-                    batch.commit().catch(err => console.error('Sync error (will retry automatically):', err));
+                    const result = await finalizeSale(orgId, org, {
+                        cart, customer, billType, paymentMode, paymentMethod,
+                        subtotal, gstAmount, billDiscountAmt, roundOff, grandTotal, udharPortion, cashAmount,
+                        udharSite, udharDueDate,
+                        staffUid: firebaseUser.uid, staffName: userDoc.name, staffEmail: userDoc.email,
+                        printed: shouldPrint
+                    });
+                    if (!result) return; // credit-limit warning was declined by staff
+                    const { saleRef, saleData } = result;
 
                     if (shouldPrint) {
                         document.getElementById('print-content').innerHTML = generateReceiptHTML({ ...saleData, id: saleRef.id }, org);
@@ -1940,6 +2244,16 @@
                             <button onClick={() => setShowHeld(true)} className="shrink-0 relative bg-slate-600 hover:bg-slate-700 text-white px-3 py-2 rounded text-sm font-bold">
                                 📋 Held{heldBills.length > 0 ? ` (${heldBills.length})` : ''}
                             </button>
+                            <button onClick={() => setShowBookingForm(true)} className="shrink-0 bg-purple-600 hover:bg-purple-700 text-white px-3 py-2 rounded text-sm font-bold" title="Advance liya, maal baad me dena hai">📝 Advance Booking</button>
+                            <button onClick={() => setShowBookings(true)} className="shrink-0 relative bg-purple-800 hover:bg-purple-900 text-white px-3 py-2 rounded text-sm font-bold">
+                                📦 Bookings{bookings.length > 0 ? ` (${bookings.length})` : ''}
+                            </button>
+                            <button onClick={() => setShowRecurring(true)} className="shrink-0 relative bg-teal-700 hover:bg-teal-800 text-white px-3 py-2 rounded text-sm font-bold">
+                                🔁 Recurring{recurringOrders.length > 0 ? ` (${recurringOrders.length})` : ''}
+                            </button>
+                            {cart.length > 0 && (
+                                <button onClick={() => setShowSaveRecurring(true)} className="shrink-0 bg-teal-100 text-teal-700 border border-teal-300 px-3 py-2 rounded text-sm font-bold" title="Isi order ko baar-baar use karne ke liye save karo">💾 Save Recurring</button>
+                            )}
                         </div>
                         <div className="flex flex-wrap gap-1 mb-3">
                             {categoriesInStock.map(c => (
@@ -2153,16 +2467,107 @@
                         </div>
                     )}
 
+                    {showBookingForm && (
+                        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+                            <div className="bg-white rounded shadow-xl w-full max-w-md p-4">
+                                <div className="flex justify-between items-center mb-3">
+                                    <h3 className="font-bold">Advance Booking Banayein</h3>
+                                    <button onClick={() => setShowBookingForm(false)} className="text-gray-400 text-xl">&times;</button>
+                                </div>
+                                <p className="text-xs text-gray-500 mb-3">Cart me jo items hain unhi ke liye booking banegi (stock abhi kam nahi hoga — maal baad me dete waqt bill banega). Pehle cart me items add karo, customer ka naam bharo, phir yahan advance amount daalo.</p>
+                                <p className="text-sm mb-2">Cart me abhi: <strong>{cart.length} items</strong> · Customer: <strong>{customer.name || '(naam nahi bhara)'}</strong></p>
+                                <input type="number" min="0" className="border p-2 rounded w-full mb-3" placeholder="Advance Amount ₹ (kitna abhi mila)" value={bookingAdvance} onChange={e => setBookingAdvance(e.target.value)} />
+                                <div className="grid grid-cols-2 gap-2">
+                                    <button onClick={() => setShowBookingForm(false)} className="bg-gray-200 p-2 rounded">Cancel</button>
+                                    <button onClick={createBooking} className="bg-purple-600 text-white p-2 rounded font-bold">Booking Save Karo</button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {showBookings && (
+                        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+                            <div className="bg-white rounded shadow-xl w-full max-w-md max-h-[80vh] flex flex-col">
+                                <div className="p-4 border-b flex justify-between items-center">
+                                    <h3 className="font-bold">Pending Bookings (Advance Liya Hua)</h3>
+                                    <button onClick={() => setShowBookings(false)} className="text-gray-400 text-xl">&times;</button>
+                                </div>
+                                <div className="flex-1 overflow-auto p-4 space-y-2">
+                                    {bookings.length === 0 && <p className="text-center text-gray-400 text-sm">Koi pending booking nahi hai.</p>}
+                                    {bookings.map(b => (
+                                        <div key={b.id} className="border rounded p-3">
+                                            <div className="flex justify-between items-start mb-2">
+                                                <div>
+                                                    <div className="font-bold">{b.label}</div>
+                                                    <div className="text-xs text-gray-500">{(b.cart || []).length} items · Advance: ₹{(b.advanceAmount || 0).toLocaleString()}</div>
+                                                </div>
+                                            </div>
+                                            <div className="flex gap-1">
+                                                <button onClick={() => convertBookingToBill(b)} className="bg-green-600 text-white text-xs px-2 py-1 rounded font-bold flex-1">Maal Diya — Bill Banao</button>
+                                                <button onClick={() => cancelBooking(b)} className="bg-red-100 text-red-600 text-xs px-2 py-1 rounded">Cancel</button>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {showRecurring && (
+                        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+                            <div className="bg-white rounded shadow-xl w-full max-w-md max-h-[80vh] flex flex-col">
+                                <div className="p-4 border-b flex justify-between items-center">
+                                    <h3 className="font-bold">🔁 Recurring Orders</h3>
+                                    <button onClick={() => setShowRecurring(false)} className="text-gray-400 text-xl">&times;</button>
+                                </div>
+                                <div className="flex-1 overflow-auto p-4 space-y-2">
+                                    {recurringOrders.length === 0 && <p className="text-center text-gray-400 text-sm">Koi recurring order save nahi hai. Cart banake "💾 Save Recurring" se banao.</p>}
+                                    {recurringOrders.map(r => (
+                                        <div key={r.id} className="border rounded p-3 flex justify-between items-center">
+                                            <div>
+                                                <div className="font-bold">{r.label}</div>
+                                                <div className="text-xs text-gray-500">{(r.cart || []).length} items · {r.customer && r.customer.name}</div>
+                                            </div>
+                                            <div className="flex gap-1">
+                                                <button onClick={() => useRecurringOrder(r)} className="bg-teal-600 text-white text-xs px-2 py-1 rounded font-bold">Load Karo</button>
+                                                <button onClick={() => deleteRecurringOrder(r)} className="bg-red-100 text-red-600 text-xs px-2 py-1 rounded">Delete</button>
+                                            </div>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
+                    {showSaveRecurring && (
+                        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
+                            <div className="bg-white rounded shadow-xl w-full max-w-sm p-4">
+                                <h3 className="font-bold mb-2">Recurring Order Save Karo</h3>
+                                <p className="text-xs text-gray-500 mb-3">Cart me {cart.length} items hain — inhe naam dekar save karo, agli baar ek click me load ho jayenge.</p>
+                                <input className="border p-2 rounded w-full mb-3" placeholder="Naam (jaise: Ramesh Contractor Monthly)" value={recurringLabel} onChange={e => setRecurringLabel(e.target.value)} />
+                                <div className="grid grid-cols-2 gap-2">
+                                    <button onClick={() => setShowSaveRecurring(false)} className="bg-gray-200 p-2 rounded">Cancel</button>
+                                    <button onClick={saveRecurringOrder} className="bg-teal-600 text-white p-2 rounded font-bold">Save</button>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+
                     {lastSale && (
                         <div className="fixed bottom-4 right-4 bg-white shadow-xl border rounded-lg p-4 z-40 w-72">
                             <p className="text-sm font-bold mb-2">Bill save ho gaya ✓</p>
                             {lastSale.customer.mobile ? (
                                 <>
                                     <button onClick={() => { sendWhatsApp(lastSale.customer.mobile, buildBillMessage(lastSale, org)); setLastSale(null); }} className="w-full bg-green-600 text-white p-2 rounded font-bold text-sm mb-1">📱 Send via WhatsApp</button>
-                                    <button onClick={() => { shareViaWhatsApp(lastSale, org); setLastSale(null); }} className="w-full bg-green-50 text-green-700 border border-green-200 p-2 rounded text-xs mb-1">📎 PDF Attach Karke Bhejo (contact khud choose karna hoga)</button>
+                                    <button onClick={() => { shareViaWhatsApp(lastSale, org); setLastSale(null); }} className="w-full bg-green-50 text-green-700 border border-green-200 p-2 rounded text-xs mb-1">📎 PDF Download + Chat Kholo</button>
                                 </>
                             ) : <p className="text-xs text-gray-400 mb-1">Customer ka mobile number nahi tha.</p>}
                             <button onClick={() => { downloadBillPDF(lastSale, org); setLastSale(null); }} className="w-full bg-gray-100 text-gray-600 p-2 rounded text-xs mb-1">Sirf PDF Download Karo</button>
+                            <button onClick={async () => {
+                                if (!confirm('Ye bill galti se ban gaya tha? Ise UNDO karne se stock wapas aa jayega aur udhar bhi revert ho jayega.')) return;
+                                try { await voidSaleGlobal(lastSale, orgId, userDoc.name); } catch (e) { alert('Error: ' + e.message); }
+                                setLastSale(null);
+                            }} className="w-full bg-red-50 text-red-600 border border-red-200 p-2 rounded text-xs mb-1">↩ Undo (Galat Bill Tha)</button>
                             <button onClick={() => setLastSale(null)} className="w-full bg-gray-100 text-gray-600 p-1 rounded text-xs">Close</button>
                         </div>
                     )}
@@ -2179,6 +2584,9 @@
             const [searchTerm, setSearchTerm] = useState('');
             const [returnSale, setReturnSale] = useState(null);
             const [returnQtys, setReturnQtys] = useState({});
+            const [exchangeMode, setExchangeMode] = useState(false);
+            const [exchangeCart, setExchangeCart] = useState([]);
+            const [exchangeQuery, setExchangeQuery] = useState('');
             const [busy, setBusy] = useState(false);
             const isAdmin = userDoc.role === 'owner' || userDoc.role === 'admin';
 
@@ -2338,26 +2746,8 @@
                 if (!confirm(`Bill #${sale.id.toString().slice(-6)} ko VOID (cancel) karna hai? Stock wapas add ho jayega.`)) return;
                 setBusy(true);
                 try {
-                    const batch = db.batch();
-                    (sale.cart || []).forEach(item => {
-                        const remaining = item.qty - (item.returnedQty || 0);
-                        if (remaining > 0) {
-                            batch.update(db.collection('orgs').doc(orgId).collection('products').doc(item.id), { stock: FieldValue.increment(remaining) });
-                        }
-                    });
-                    const remainingUdhar = Math.max(0, (sale.udharAmount || 0) - (sale.returnedTotal || 0));
-                    if (sale.partyId && remainingUdhar > 0) {
-                        const partyRef = db.collection('orgs').doc(orgId).collection('parties').doc(sale.partyId);
-                        batch.update(partyRef, { balance: FieldValue.increment(-remainingUdhar) });
-                        batch.set(partyRef.collection('transactions').doc(), {
-                            type: 'payment_received', amount: remainingUdhar, note: `Bill #${sale.id.toString().slice(-6)} voided`,
-                            date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp()
-                        });
-                    }
-                    batch.update(db.collection('orgs').doc(orgId).collection('sales').doc(sale.id), {
-                        voided: true, voidedAt: FieldValue.serverTimestamp(), voidedByName: userDoc.name
-                    });
-                    await batch.commit();
+                    await voidSaleGlobal(sale, orgId, userDoc.name);
+                    logActivity(orgId, userDoc, 'Bill Voided', `Bill #${sale.id.toString().slice(-6)} — ₹${sale.grandTotal}`);
                 } catch (e) {
                     alert('Error: ' + e.message);
                 } finally {
@@ -2368,7 +2758,25 @@
             const openReturn = (sale) => {
                 setReturnSale(sale);
                 setReturnQtys({});
+                setExchangeMode(false);
+                setExchangeCart([]);
+                setExchangeQuery('');
             };
+
+            const addExchangeItem = (p) => {
+                setExchangeCart(prev => {
+                    const idx = prev.findIndex(it => it.id === p.id);
+                    if (idx >= 0) {
+                        const updated = [...prev];
+                        updated[idx] = { ...updated[idx], qty: updated[idx].qty + 1, total: (updated[idx].qty + 1) * p.priceSell };
+                        return updated;
+                    }
+                    return [...prev, { id: p.id, name: p.name, unit: p.unit, priceSell: p.priceSell, qty: 1, total: p.priceSell }];
+                });
+                setExchangeQuery('');
+            };
+            const removeExchangeItem = (id) => setExchangeCart(prev => prev.filter(it => it.id !== id));
+            const changeExchangeQty = (id, qty) => setExchangeCart(prev => prev.map(it => it.id === id ? { ...it, qty: Math.max(1, Number(qty) || 1), total: Math.max(1, Number(qty) || 1) * it.priceSell } : it));
 
             const submitReturn = async () => {
                 const items = (returnSale.cart || []).map((item, idx) => ({ item, idx, qty: Number(returnQtys[idx]) || 0 }))
@@ -2378,6 +2786,7 @@
                     const remaining = x.item.qty - (x.item.returnedQty || 0);
                     if (x.qty > remaining) { alert(`${x.item.name}: max ${remaining} hi return ho sakta hai.`); return; }
                 }
+                if (exchangeMode && exchangeCart.length === 0) { alert('Exchange mode me kam se kam ek naya item chuno.'); return; }
                 setBusy(true);
                 try {
                     const totalReturnAmount = items.reduce((s, x) => s + x.item.finalPrice * x.qty, 0);
@@ -2386,38 +2795,68 @@
                         const match = items.find(x => x.idx === idx);
                         return match ? { ...item, returnedQty: (item.returnedQty || 0) + match.qty } : item;
                     });
+                    const exchangeTotal = exchangeCart.reduce((s, it) => s + it.total, 0);
+                    // Net amount: positive = customer needs to pay more (took costlier
+                    // items in exchange); negative = we owe them money/credit back.
+                    const netAmount = exchangeTotal - totalReturnAmount;
 
                     const batch = db.batch();
                     items.forEach(x => {
                         batch.update(db.collection('orgs').doc(orgId).collection('products').doc(x.item.id), { stock: FieldValue.increment(x.qty) });
                     });
+                    if (exchangeMode) {
+                        exchangeCart.forEach(it => {
+                            batch.update(db.collection('orgs').doc(orgId).collection('products').doc(it.id), { stock: FieldValue.increment(-it.qty) });
+                        });
+                    }
                     batch.update(db.collection('orgs').doc(orgId).collection('sales').doc(returnSale.id), {
                         cart: newCart,
                         returnedTotal: FieldValue.increment(totalReturnAmount),
                         returnedProfit: FieldValue.increment(totalReturnProfit)
                     });
 
-                    const remainingUdhar = Math.max(0, (returnSale.udharAmount || 0) - (returnSale.returnedTotal || 0));
-                    const partyReduction = Math.min(totalReturnAmount, remainingUdhar);
-                    if (returnSale.partyId && partyReduction > 0) {
+                    // For udhar-linked bills, apply the return credit to reduce what's
+                    // owed. If it's an exchange and the new items cost MORE, the extra
+                    // increases the udhar instead of reducing it.
+                    if (returnSale.partyId) {
+                        const remainingUdhar = Math.max(0, (returnSale.udharAmount || 0) - (returnSale.returnedTotal || 0));
                         const partyRef = db.collection('orgs').doc(orgId).collection('parties').doc(returnSale.partyId);
-                        batch.update(partyRef, { balance: FieldValue.increment(-partyReduction) });
-                        batch.set(partyRef.collection('transactions').doc(), {
-                            type: 'payment_received', amount: partyReduction, note: `Return against Bill #${returnSale.id.toString().slice(-6)}`,
-                            date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp()
-                        });
+                        if (exchangeMode && netAmount > 0) {
+                            batch.update(partyRef, { balance: FieldValue.increment(netAmount) });
+                            batch.set(partyRef.collection('transactions').doc(), {
+                                type: 'sale_credit', amount: netAmount, note: `Exchange against Bill #${returnSale.id.toString().slice(-6)} (extra item value)`,
+                                date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp()
+                            });
+                        } else {
+                            const creditBack = exchangeMode ? Math.min(-netAmount, remainingUdhar) : Math.min(totalReturnAmount, remainingUdhar);
+                            if (creditBack > 0) {
+                                batch.update(partyRef, { balance: FieldValue.increment(-creditBack) });
+                                batch.set(partyRef.collection('transactions').doc(), {
+                                    type: 'payment_received', amount: creditBack, note: `${exchangeMode ? 'Exchange' : 'Return'} against Bill #${returnSale.id.toString().slice(-6)}`,
+                                    date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp()
+                                });
+                            }
+                        }
                     }
 
                     batch.set(db.collection('orgs').doc(orgId).collection('returns').doc(), {
-                        type: 'sale_return', saleId: returnSale.id,
+                        type: exchangeMode ? 'sale_exchange' : 'sale_return', saleId: returnSale.id,
                         items: items.map(x => ({ productId: x.item.id, name: x.item.name, qty: x.qty, finalPrice: x.item.finalPrice, total: x.item.finalPrice * x.qty })),
-                        totalAmount: totalReturnAmount, date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp(),
+                        exchangeItems: exchangeMode ? exchangeCart : [],
+                        totalAmount: totalReturnAmount, exchangeTotal, netAmount: exchangeMode ? netAmount : -totalReturnAmount,
+                        date: new Date().toISOString(), createdAt: FieldValue.serverTimestamp(),
                         staffUid: userDoc.uid, staffName: userDoc.name
                     });
 
                     await batch.commit();
+                    logActivity(orgId, userDoc, exchangeMode ? 'Sale Exchange' : 'Sale Return', `Bill #${returnSale.id.toString().slice(-6)} — ₹${totalReturnAmount.toFixed(2)} returned${exchangeMode ? `, ₹${exchangeTotal.toFixed(2)} exchanged` : ''}`);
+                    if (exchangeMode) {
+                        alert(netAmount > 0 ? `Customer se ₹${netAmount.toFixed(2)} aur lena hai.` : netAmount < 0 ? `Customer ko ₹${(-netAmount).toFixed(2)} wapas/credit dena hai.` : 'Exchange barabar hai, kuch lena-dena nahi.');
+                    }
                     setReturnSale(null);
                     setReturnQtys({});
+                    setExchangeMode(false);
+                    setExchangeCart([]);
                 } catch (e) {
                     alert('Error: ' + e.message);
                 } finally {
@@ -2489,7 +2928,7 @@
                                             {s.customer.mobile && (
                                                 <>
                                                     <button onClick={() => sendWhatsApp(s.customer.mobile, buildBillMessage(s, org))} title="Seedha message bhejo" className="text-green-600 text-xs border px-2 py-1 rounded mr-1">📱</button>
-                                                    <button onClick={() => shareViaWhatsApp(s, org)} title="PDF attach karke bhejo (contact khud choose karna hoga)" className="text-green-700 text-xs border px-2 py-1 rounded mr-1">📎</button>
+                                                    <button onClick={() => shareViaWhatsApp(s, org)} title="PDF download karke exact chat kholo" className="text-green-700 text-xs border px-2 py-1 rounded mr-1">📎</button>
                                                 </>
                                             )}
                                             {isAdmin && !s.voided && (
@@ -2510,10 +2949,17 @@
                         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50 p-4">
                             <div className="bg-white rounded shadow-xl w-full max-w-lg max-h-[90vh] flex flex-col">
                                 <div className="p-4 border-b flex justify-between items-center">
-                                    <h3 className="font-bold">Return — Bill #{returnSale.id.toString().slice(-6)}</h3>
+                                    <h3 className="font-bold">{exchangeMode ? 'Exchange' : 'Return'} — Bill #{returnSale.id.toString().slice(-6)}</h3>
                                     <button onClick={() => setReturnSale(null)} className="text-gray-400 text-xl">&times;</button>
                                 </div>
+                                <div className="px-4 pt-3">
+                                    <label className="flex items-center gap-2 text-sm cursor-pointer bg-gray-50 p-2 rounded">
+                                        <input type="checkbox" checked={exchangeMode} onChange={e => { setExchangeMode(e.target.checked); setExchangeCart([]); }} />
+                                        <span className="font-bold">Exchange — customer naya item bhi le jayega (sirf refund nahi)</span>
+                                    </label>
+                                </div>
                                 <div className="p-4 overflow-auto flex-1 space-y-3">
+                                    <p className="text-xs font-bold text-gray-500">Wapas le rahe ho:</p>
                                     {(returnSale.cart || []).map((item, idx) => {
                                         const remaining = item.qty - (item.returnedQty || 0);
                                         return (
@@ -2529,10 +2975,53 @@
                                             </div>
                                         );
                                     })}
+
+                                    {exchangeMode && (
+                                        <div className="pt-2">
+                                            <p className="text-xs font-bold text-gray-500 mb-2">Badle me naya item de rahe ho:</p>
+                                            <div className="relative mb-2">
+                                                <input className="border p-2 rounded w-full text-sm" placeholder="Product search karo..." value={exchangeQuery} onChange={e => setExchangeQuery(e.target.value)} />
+                                                {exchangeQuery.length > 1 && (
+                                                    <div className="absolute top-full left-0 w-full bg-white border shadow-lg z-20 max-h-40 overflow-auto">
+                                                        {products.filter(p => p.name.toLowerCase().includes(exchangeQuery.toLowerCase())).slice(0, 6).map(p => (
+                                                            <div key={p.id} onClick={() => addExchangeItem(p)} className="p-2 hover:bg-gray-100 cursor-pointer text-sm">
+                                                                {p.name} — ₹{p.priceSell} (Stock: {p.stock})
+                                                            </div>
+                                                        ))}
+                                                    </div>
+                                                )}
+                                            </div>
+                                            {exchangeCart.map(it => (
+                                                <div key={it.id} className="flex justify-between items-center border-b py-1 text-sm">
+                                                    <span>{it.name}</span>
+                                                    <div className="flex items-center gap-2">
+                                                        <input type="number" min="1" className="border rounded w-14 text-center p-1" value={it.qty} onChange={e => changeExchangeQty(it.id, e.target.value)} />
+                                                        <span className="font-bold">₹{it.total.toFixed(2)}</span>
+                                                        <button onClick={() => removeExchangeItem(it.id)} className="text-red-500">×</button>
+                                                    </div>
+                                                </div>
+                                            ))}
+                                        </div>
+                                    )}
                                 </div>
                                 <div className="p-4 border-t">
+                                    {exchangeMode && exchangeCart.length > 0 && (() => {
+                                        const returnTotal = (returnSale.cart || []).reduce((s, item, idx) => s + item.finalPrice * (Number(returnQtys[idx]) || 0), 0);
+                                        const exTotal = exchangeCart.reduce((s, it) => s + it.total, 0);
+                                        const net = exTotal - returnTotal;
+                                        return (
+                                            <div className="bg-yellow-50 border border-yellow-200 rounded p-2 mb-2 text-sm">
+                                                <div className="flex justify-between"><span>Return Value</span><span>₹{returnTotal.toFixed(2)}</span></div>
+                                                <div className="flex justify-between"><span>New Items Value</span><span>₹{exTotal.toFixed(2)}</span></div>
+                                                <div className={`flex justify-between font-bold border-t mt-1 pt-1 ${net > 0 ? 'text-red-600' : 'text-green-600'}`}>
+                                                    <span>{net > 0 ? 'Customer se aur lena hai' : net < 0 ? 'Customer ko wapas/credit dena hai' : 'Barabar hai'}</span>
+                                                    <span>₹{Math.abs(net).toFixed(2)}</span>
+                                                </div>
+                                            </div>
+                                        );
+                                    })()}
                                     <button disabled={busy} onClick={submitReturn} className="w-full bg-blue-600 text-white p-3 rounded font-bold disabled:opacity-50">
-                                        {busy ? 'Processing...' : 'Return Confirm Karo'}
+                                        {busy ? 'Processing...' : (exchangeMode ? 'Exchange Confirm Karo' : 'Return Confirm Karo')}
                                     </button>
                                     <p className="text-xs text-gray-400 mt-2">Stock wapas add hoga, aur agar udhar tha to customer ka khata us hisaab se adjust hoga.</p>
                                 </div>
@@ -2725,7 +3214,7 @@
             dashboard: 'View Dashboard'
         };
 
-        const UserMgmt = ({ orgId, org, lang }) => {
+        const UserMgmt = ({ orgId, org, lang, userDoc }) => {
             const [users, setUsers] = useState([]);
             const [expandedId, setExpandedId] = useState(null);
             const [staffForm, setStaffForm] = useState({ name: '', username: '', password: '' });
@@ -2761,18 +3250,23 @@
                 const update = { role };
                 if (role === 'staff' && !u.permissions) update.permissions = defaultPermissions();
                 await db.collection('users').doc(u.id).update(update);
+                logActivity(orgId, userDoc, 'Role Changed', `${u.name} → ${role}`);
             };
             const togglePermission = async (u, key) => {
                 const perms = { ...(u.permissions || defaultPermissions()) };
                 perms[key] = !perms[key];
                 await db.collection('users').doc(u.id).update({ permissions: perms });
+                logActivity(orgId, userDoc, 'Permission Changed', `${u.name} — ${key}: ${perms[key] ? 'ON' : 'OFF'}`);
             };
             const setCommission = async (u, pct) => {
                 await db.collection('users').doc(u.id).update({ commissionPct: Number(pct) || 0 });
             };
             const disable = async (u) => {
                 if (u.role === 'owner') return alert('Cannot disable the owner.');
-                if (confirm(`Disable ${u.name}'s access?`)) await db.collection('users').doc(u.id).update({ status: 'disabled' });
+                if (confirm(`Disable ${u.name}'s access?`)) {
+                    await db.collection('users').doc(u.id).update({ status: 'disabled' });
+                    logActivity(orgId, userDoc, 'Staff Disabled', u.name);
+                }
             };
             const reEnable = async (u) => { await db.collection('users').doc(u.id).update({ status: 'active' }); };
 
@@ -2816,6 +3310,7 @@
                         createdAt: FieldValue.serverTimestamp()
                     });
                     await secAuth.signOut();
+                    logActivity(orgId, userDoc, resetTargetId ? 'Staff Password Reset' : 'Staff Login Created', `${staffForm.name.trim()} (${uname})`);
                     if (resetTargetId) {
                         await db.collection('users').doc(resetTargetId).update({ status: 'disabled' });
                         setCreateOk(`Naya password set ho gaya! "${staffForm.name.trim()}" ab is naye username se login karega: ${uname}`);
@@ -2957,19 +3452,45 @@
         // 10. SETTINGS (org profile used on printed bills)
         // ============================================================
         const Settings = ({ orgId, org, lang }) => {
-            const [form, setForm] = useState({ name: org.name || '', address: org.address || '', mobile: org.mobile || '', gstin: org.gstin || '' });
+            const [form, setForm] = useState({ name: org.name || '', address: org.address || '', mobile: org.mobile || '', gstin: org.gstin || '', ownerWhatsapp: org.ownerWhatsapp || '', maxDiscountPct: org.maxDiscountPct != null ? org.maxDiscountPct : '' });
             const [saved, setSaved] = useState(false);
             const [backupBusy, setBackupBusy] = useState(false);
             const [restoreBusy, setRestoreBusy] = useState(false);
             const [restoreMsg, setRestoreMsg] = useState('');
             const [logoBusy, setLogoBusy] = useState(false);
             const [logoErr, setLogoErr] = useState('');
+            const [showActivityLog, setShowActivityLog] = useState(false);
+            const [activityLog, setActivityLog] = useState([]);
             const restoreFileRef = useRef();
             const logoFileRef = useRef();
+            const [branches, setBranches] = useState(org.branches || []);
+            const [newBranchName, setNewBranchName] = useState('');
+
+            useEffect(() => {
+                if (!showActivityLog) return;
+                const unsub = db.collection('orgs').doc(orgId).collection('activityLog').orderBy('createdAt', 'desc').limit(100).onSnapshot(snap => {
+                    setActivityLog(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+                });
+                return unsub;
+            }, [orgId, showActivityLog]);
+
+            const addBranch = async () => {
+                if (!newBranchName.trim()) return;
+                const updated = [...branches, { id: 'b' + Date.now(), name: newBranchName.trim() }];
+                setBranches(updated);
+                await db.collection('orgs').doc(orgId).update({ branches: updated });
+                setNewBranchName('');
+            };
+            const removeBranch = async (id) => {
+                const updated = branches.filter(b => b.id !== id);
+                setBranches(updated);
+                await db.collection('orgs').doc(orgId).update({ branches: updated });
+            };
 
             const save = async (e) => {
                 e.preventDefault();
-                await db.collection('orgs').doc(orgId).update(form);
+                const toSave = { ...form, maxDiscountPct: form.maxDiscountPct === '' ? FieldValue.delete() : Number(form.maxDiscountPct) };
+                await db.collection('orgs').doc(orgId).update(toSave);
                 setSaved(true); setTimeout(() => setSaved(false), 1500);
             };
 
@@ -3044,6 +3565,7 @@
                     const url = window.URL.createObjectURL(blob);
                     const a = document.createElement('a');
                     a.href = url; a.download = `${(org.name || 'buildmart').replace(/\s+/g, '_')}_backup_${new Date().toISOString().slice(0, 10)}.json`; a.click();
+                    await db.collection('orgs').doc(orgId).update({ lastBackupDate: new Date().toISOString() });
                 } catch (e) {
                     alert('Backup Error: ' + e.message);
                 } finally {
@@ -3112,6 +3634,12 @@
                         <div><label className="text-sm font-bold block mb-1">Address</label><input className="w-full border p-2 rounded" value={form.address} onChange={e => setForm({ ...form, address: e.target.value })} /></div>
                         <div><label className="text-sm font-bold block mb-1">Mobile</label><input className="w-full border p-2 rounded" value={form.mobile} onChange={e => setForm({ ...form, mobile: e.target.value })} /></div>
                         <div><label className="text-sm font-bold block mb-1">GSTIN (optional)</label><input className="w-full border p-2 rounded" value={form.gstin} onChange={e => setForm({ ...form, gstin: e.target.value })} /></div>
+                        <div><label className="text-sm font-bold block mb-1">Owner WhatsApp Number (low stock alerts ke liye)</label><input className="w-full border p-2 rounded" placeholder="10 digit mobile" value={form.ownerWhatsapp} onChange={e => setForm({ ...form, ownerWhatsapp: e.target.value })} /></div>
+                        <div>
+                            <label className="text-sm font-bold block mb-1">Max Discount % Bina Approval Ke (staff ke liye)</label>
+                            <input type="number" min="0" max="100" className="w-full border p-2 rounded" placeholder="Khaali = koi limit nahi" value={form.maxDiscountPct} onChange={e => setForm({ ...form, maxDiscountPct: e.target.value })} />
+                            <p className="text-xs text-gray-500 mt-1">Agar staff isse zyada discount de, to bill seedha nahi banega — pehle aapke (admin) approval ke liye jayega.</p>
+                        </div>
                         <button className="bg-orange-600 text-white px-4 py-2 rounded font-bold">{saved ? 'Saved ✓' : 'Save'}</button>
                     </form>
 
@@ -3128,6 +3656,49 @@
                         <input ref={logoFileRef} type="file" accept="image/*" onChange={handleLogoUpload} disabled={logoBusy} className="text-sm" />
                         {logoBusy && <p className="text-xs text-gray-500 mt-1">Upload ho raha hai...</p>}
                         {logoErr && <p className="text-xs text-red-600 mt-1">{logoErr}</p>}
+                    </div>
+
+                    <div className="bg-white p-6 rounded shadow max-w-xl mb-6">
+                        <h3 className="font-bold mb-1">Shop Branches (agar future mein doosri dukan bhi ho)</h3>
+                        <p className="text-xs text-gray-500 mb-3">
+                            Abhi ye sirf naam-tag ke liye hai — bills/reports mein filter karne ke liye. Inventory/stock filhaal sab branches ke beech <strong>shared</strong> rehta hai (alag-alag stock track karna abhi support nahi hai).
+                        </p>
+                        <div className="flex gap-2 mb-3">
+                            <input className="border p-2 rounded flex-1" placeholder="Branch ka naam (jaise: Latur Main, Ausa Road)" value={newBranchName} onChange={e => setNewBranchName(e.target.value)} />
+                            <button onClick={addBranch} className="bg-slate-700 text-white px-4 py-2 rounded font-bold">+ Add</button>
+                        </div>
+                        {branches.length > 0 ? (
+                            <div className="space-y-1">
+                                {branches.map(b => (
+                                    <div key={b.id} className="flex justify-between items-center bg-gray-50 p-2 rounded text-sm">
+                                        <span className="font-bold">{b.name}</span>
+                                        <button onClick={() => removeBranch(b.id)} className="text-red-500 text-xs">Remove</button>
+                                    </div>
+                                ))}
+                            </div>
+                        ) : <p className="text-xs text-gray-400">Koi branch add nahi ki gayi — single-shop mode chal raha hai.</p>}
+                    </div>
+
+                    <div className="bg-white p-6 rounded shadow max-w-xl mb-6">
+                        <h3 className="font-bold mb-2">Staff Activity Log</h3>
+                        <p className="text-sm text-gray-500 mb-3">Kis staff ne kab kya kiya (bill void, product delete, permission change, etc.) — audit ke liye.</p>
+                        <button onClick={() => setShowActivityLog(!showActivityLog)} className="bg-slate-700 text-white px-4 py-2 rounded font-bold mb-3">
+                            {showActivityLog ? 'Chhupao' : 'Activity Log Dekho'}
+                        </button>
+                        {showActivityLog && (
+                            <div className="max-h-96 overflow-auto border rounded">
+                                {activityLog.map(a => (
+                                    <div key={a.id} className="p-2 border-b text-sm">
+                                        <div className="flex justify-between">
+                                            <span className="font-bold">{a.action}</span>
+                                            <span className="text-xs text-gray-400">{new Date(a.date).toLocaleString()}</span>
+                                        </div>
+                                        <div className="text-xs text-gray-500">{a.staffName} — {a.details}</div>
+                                    </div>
+                                ))}
+                                {activityLog.length === 0 && <p className="p-4 text-center text-gray-400 text-sm">Abhi tak koi activity record nahi hai.</p>}
+                            </div>
+                        )}
                     </div>
 
                     <div className="bg-white p-6 rounded shadow max-w-xl">
@@ -3269,6 +3840,7 @@
 
             const setCreditLimit = async (val) => {
                 await partiesRef.doc(openParty.id).update({ creditLimit: Number(val) || 0 });
+                logActivity(orgId, userDoc, 'Credit Limit Changed', `${openParty.name} → ₹${Number(val) || 0}`);
             };
 
             // ------- Customer Directory: Add / Edit / Delete / Restore -------
@@ -3289,11 +3861,13 @@
                     await customersRef.doc(editingCustomerId).update({
                         name: customerForm.name.trim(), mobile: customerForm.mobile.trim(), address: customerForm.address.trim()
                     });
+                    logActivity(orgId, userDoc, 'Customer Edited', customerForm.name.trim() || customerForm.mobile.trim());
                 } else {
                     await customersRef.add({
                         name: customerForm.name.trim(), mobile: customerForm.mobile.trim(), address: customerForm.address.trim(),
                         totalPurchases: 0, totalSpent: 0, deleted: false, createdAt: FieldValue.serverTimestamp()
                     });
+                    logActivity(orgId, userDoc, 'Customer Added', customerForm.name.trim() || customerForm.mobile.trim());
                 }
                 setShowAddCustomer(false);
                 setCustomerForm({ name: '', mobile: '', address: '' });
@@ -3305,11 +3879,13 @@
             const deleteCustomer = async (c) => {
                 if (confirm(`"${c.name || c.mobile}" ko directory se hatana hai? Admin baad me restore kar sakta hai.`)) {
                     await customersRef.doc(c.id).update({ deleted: true, deletedAt: FieldValue.serverTimestamp() });
+                    logActivity(orgId, userDoc, 'Customer Deleted', c.name || c.mobile);
                     setOpenCustomer(null);
                 }
             };
             const restoreCustomer = async (c) => {
                 await customersRef.doc(c.id).update({ deleted: false, deletedAt: FieldValue.delete() });
+                logActivity(orgId, userDoc, 'Customer Restored', c.name || c.mobile);
             };
 
             const submitPurchaseReturn = async () => {
@@ -3845,6 +4421,141 @@
         // DUE REMINDERS BANNER (visible to everyone, owner + staff both)
         // "Kis customer/supplier se kab paisa lena/dena hai" reminder strip.
         // ============================================================
+        // Quick instant-lookup search — searches whatever's already loaded
+        // (products, customers, recent sales) and shows key info right in the
+        // dropdown, without navigating away from whatever screen you're on.
+        const GlobalSearch = ({ products, sales, customersList, lang }) => {
+            const [query, setQuery] = useState('');
+            const [open, setOpen] = useState(false);
+
+            const q = query.trim().toLowerCase();
+            const matchedProducts = q.length > 1 ? products.filter(p => p.name.toLowerCase().includes(q) || (p.barcode || '').includes(q)).slice(0, 5) : [];
+            const matchedCustomers = q.length > 1 ? customersList.filter(c => !c.deleted && ((c.name || '').toLowerCase().includes(q) || (c.mobile || '').includes(q))).slice(0, 5) : [];
+            const matchedSales = q.length > 1 ? sales.filter(s => !s.voided && (s.id.toString().includes(q) || (s.customer.name || '').toLowerCase().includes(q))).slice(0, 5).reverse() : [];
+            const hasResults = matchedProducts.length + matchedCustomers.length + matchedSales.length > 0;
+
+            return (
+                <div className="relative">
+                    <input
+                        className="w-full bg-slate-800 text-white text-sm p-2 rounded border border-slate-600 placeholder-slate-400"
+                        placeholder="🔍 Search product/customer/bill..."
+                        value={query}
+                        onChange={e => { setQuery(e.target.value); setOpen(true); }}
+                        onFocus={() => setOpen(true)}
+                    />
+                    {open && q.length > 1 && (
+                        <div className="absolute left-0 top-full mt-1 w-80 bg-white text-black rounded shadow-xl z-50 max-h-96 overflow-auto border">
+                            <div className="p-2 flex justify-end"><button onClick={() => setOpen(false)} className="text-xs text-gray-400">Close ✕</button></div>
+                            {!hasResults && <p className="p-3 text-center text-gray-400 text-sm">Kuch nahi mila.</p>}
+                            {matchedProducts.length > 0 && (
+                                <div>
+                                    <div className="px-3 py-1 bg-gray-100 text-xs font-bold text-gray-500">Products</div>
+                                    {matchedProducts.map(p => (
+                                        <div key={p.id} className="px-3 py-2 border-b text-sm">
+                                            <div className="font-bold">{p.name}</div>
+                                            <div className="text-xs text-gray-500">Stock: {p.stock} {p.unit} · Rate: ₹{p.priceSell}{p.gstApplicable === false ? ' · No GST' : ` · GST ${p.gst}%`}</div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                            {matchedCustomers.length > 0 && (
+                                <div>
+                                    <div className="px-3 py-1 bg-gray-100 text-xs font-bold text-gray-500">Customers</div>
+                                    {matchedCustomers.map(c => (
+                                        <div key={c.id} className="px-3 py-2 border-b text-sm">
+                                            <div className="font-bold">{c.name || 'Walk-in'} <span className="text-xs text-gray-400 font-normal">{c.mobile}</span></div>
+                                            <div className="text-xs text-gray-500">{c.totalPurchases || 0} purchases · Total: ₹{(c.totalSpent || 0).toLocaleString()}</div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                            {matchedSales.length > 0 && (
+                                <div>
+                                    <div className="px-3 py-1 bg-gray-100 text-xs font-bold text-gray-500">Bills</div>
+                                    {matchedSales.map(s => (
+                                        <div key={s.id} className="px-3 py-2 border-b text-sm">
+                                            <div className="font-bold">#{s.id.toString().slice(-6)} — {s.customer.name || 'Walk-in'}</div>
+                                            <div className="text-xs text-gray-500">{new Date(s.date).toLocaleDateString()} · ₹{s.grandTotal}</div>
+                                        </div>
+                                    ))}
+                                </div>
+                            )}
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
+        // Shows pending "discount too high" bills to the admin — Approve
+        // actually completes the sale (via the same finalizeSale used by
+        // normal billing), Reject just discards the request (nothing was ever
+        // deducted from stock, since the sale never happened yet).
+        const ApprovalWidget = ({ orgId, org, isAdmin }) => {
+            const [pending, setPending] = useState([]);
+            const [expanded, setExpanded] = useState(false);
+            const [busyId, setBusyId] = useState(null);
+
+            useEffect(() => {
+                if (!isAdmin) return;
+                const unsub = db.collection('orgs').doc(orgId).collection('pendingApprovals').where('status', '==', 'pending').onSnapshot(snap => {
+                    setPending(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+                });
+                return unsub;
+            }, [orgId, isAdmin]);
+
+            if (!isAdmin || pending.length === 0) return null;
+
+            const approve = async (p) => {
+                setBusyId(p.id);
+                try {
+                    const result = await finalizeSale(orgId, org, {
+                        cart: p.cart, customer: p.customer, billType: p.billType, paymentMode: p.paymentMode, paymentMethod: p.paymentMethod,
+                        subtotal: p.subtotal, gstAmount: p.gstAmount, billDiscountAmt: p.billDiscountAmt, roundOff: p.roundOff, grandTotal: p.grandTotal,
+                        udharPortion: p.udharPortion, cashAmount: p.cashAmount, udharSite: p.udharSite, udharDueDate: p.udharDueDate,
+                        staffUid: p.requestedByUid, staffName: p.requestedByName, staffEmail: p.requestedByEmail,
+                        printed: false, skipCreditCheck: true
+                    });
+                    if (result) {
+                        await db.collection('orgs').doc(orgId).collection('pendingApprovals').doc(p.id).update({ status: 'approved' });
+                    }
+                } catch (e) {
+                    alert('Error: ' + e.message);
+                } finally {
+                    setBusyId(null);
+                }
+            };
+            const reject = async (p) => {
+                if (confirm(`${p.requestedByName} ka ${p.discountPct.toFixed(1)}% discount wala bill REJECT karna hai?`)) {
+                    await db.collection('orgs').doc(orgId).collection('pendingApprovals').doc(p.id).update({ status: 'rejected' });
+                }
+            };
+
+            return (
+                <div className="no-print bg-white border-b-2 border-purple-300 px-4 py-2">
+                    <div className="flex justify-between items-center cursor-pointer" onClick={() => setExpanded(!expanded)}>
+                        <span className="font-bold text-purple-700">💰 Discount Approval Chahiye — {pending.length}</span>
+                        <span className="text-xs text-gray-400">{expanded ? 'Chhupao ▲' : 'Dikhao ▼'}</span>
+                    </div>
+                    {expanded && (
+                        <div className="mt-2 max-h-64 overflow-auto space-y-2">
+                            {pending.map(p => (
+                                <div key={p.id} className="border rounded p-2 flex justify-between items-center text-sm">
+                                    <div>
+                                        <span className="font-bold">{p.customer.name || 'Walk-in'}</span> — {(p.cart || []).length} items — ₹{p.grandTotal}
+                                        <div className="text-xs text-gray-500">{p.requestedByName} ne {p.discountPct.toFixed(1)}% discount diya (limit: {org.maxDiscountPct}%)</div>
+                                    </div>
+                                    <div className="flex gap-1">
+                                        <button disabled={busyId === p.id} onClick={() => approve(p)} className="bg-green-600 text-white text-xs px-2 py-1 rounded font-bold disabled:opacity-50">✓ Approve</button>
+                                        <button disabled={busyId === p.id} onClick={() => reject(p)} className="bg-red-100 text-red-600 text-xs px-2 py-1 rounded">✕ Reject</button>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+                    )}
+                </div>
+            );
+        };
+
         const DueRemindersBanner = ({ orgId, org, dueReminders, lang }) => {
             const [expanded, setExpanded] = useState(false);
 
@@ -3916,6 +4627,7 @@
             const [sales, setSales] = useState([]);
             const [purchases, setPurchases] = useState([]);
             const [dueReminders, setDueReminders] = useState([]);
+            const [customersList, setCustomersList] = useState([]); // used by Global Search
             const [lang, setLang] = useState(() => localStorage.getItem('buildmart_lang') || 'en');
             const [isOnline, setIsOnline] = useState(navigator.onLine);
             const orgId = userDoc.orgId;
@@ -3946,7 +4658,8 @@
                 const unsubSales = db.collection('orgs').doc(orgId).collection('sales').orderBy('date').onSnapshot(snap => setSales(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
                 const unsubPurch = db.collection('orgs').doc(orgId).collection('purchases').orderBy('date').onSnapshot(snap => setPurchases(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
                 const unsubDue = db.collection('orgs').doc(orgId).collection('dueReminders').where('resolved', '==', false).onSnapshot(snap => setDueReminders(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
-                return () => { unsubOrg(); unsubProd(); unsubSales(); unsubPurch(); unsubDue(); };
+                const unsubCust = db.collection('orgs').doc(orgId).collection('customers').onSnapshot(snap => setCustomersList(snap.docs.map(d => ({ id: d.id, ...d.data() }))));
+                return () => { unsubOrg(); unsubProd(); unsubSales(); unsubPurch(); unsubDue(); unsubCust(); };
             }, [orgId]);
 
             useEffect(() => {
@@ -3990,6 +4703,9 @@
                                 {Object.keys(LANGUAGES).map(l => <option key={l} value={l}>{LANGUAGES[l]}</option>)}
                             </select>
                         </div>
+                        <div className="p-2 border-b border-slate-700">
+                            <GlobalSearch products={products} sales={sales} customersList={customersList} lang={lang} />
+                        </div>
                         <nav className="flex-1 p-2 space-y-1 overflow-auto">
                             {canDashboard && <button onClick={() => setView('dashboard')} className={`w-full text-left p-3 rounded ${view === 'dashboard' ? 'bg-slate-700' : ''}`}>{t(lang, 'nav_dashboard')}</button>}
                             {canPOS && <button onClick={() => setView('pos')} className={`w-full text-left p-3 rounded ${view === 'pos' ? 'bg-slate-700' : ''}`}>{t(lang, 'nav_pos')}</button>}
@@ -4008,15 +4724,16 @@
                     </div>
 
                     <div className="flex-1 bg-gray-100 h-full overflow-hidden flex flex-col">
+                        <ApprovalWidget orgId={orgId} org={org} isAdmin={isAdmin} />
                         <DueRemindersBanner orgId={orgId} org={org} dueReminders={dueReminders} lang={lang} />
-                        {view === 'dashboard' && canDashboard && <Dashboard sales={sales} products={products} lang={lang} />}
+                        {view === 'dashboard' && canDashboard && <Dashboard sales={sales} products={products} lang={lang} org={org} isAdmin={isAdmin} />}
                         {view === 'pos' && canPOS && <POS orgId={orgId} org={org} products={products} userDoc={userDoc} firebaseUser={firebaseUser} lang={lang} />}
                         {view === 'inventory' && canInventory && <Inventory orgId={orgId} products={products} isAdmin={isAdmin} lang={lang} userDoc={userDoc} />}
                         {view === 'khata' && canKhata && <KhataBook orgId={orgId} org={org} userDoc={userDoc} firebaseUser={firebaseUser} products={products} sales={sales} lang={lang} isAdmin={isAdmin} />}
                         {view === 'reports' && canReports && <SalesReport orgId={orgId} org={org} sales={sales} purchases={purchases} products={products} userDoc={userDoc} lang={lang} />}
                         {view === 'profit' && canProfit && <ProfitLoss orgId={orgId} org={org} sales={sales} lang={lang} />}
                         {view === 'quotation' && canPOS && <Quotation products={products} org={org} />}
-                        {view === 'users' && isAdmin && <UserMgmt orgId={orgId} org={org} lang={lang} />}
+                        {view === 'users' && isAdmin && <UserMgmt orgId={orgId} org={org} lang={lang} userDoc={userDoc} />}
                         {view === 'settings' && isAdmin && <Settings orgId={orgId} org={org} lang={lang} />}
                     </div>
                 </div>
