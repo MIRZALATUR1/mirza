@@ -413,7 +413,7 @@
         // (b) the admin "Approve" action on a discount that needed sign-off,
         // so both paths behave identically and stay in sync.
         async function finalizeSale(orgId, org, input) {
-            const { cart, customer, billType, paymentMode, paymentMethod, subtotal, gstAmount, billDiscountAmt, roundOff, grandTotal, udharPortion, cashAmount, udharSite, udharDueDate, staffUid, staffName, staffEmail, printed, skipCreditCheck } = input;
+            const { cart, customer, billType, paymentMode, paymentMethod, subtotal, gstAmount, billDiscountAmt, roundOff, grandTotal, udharPortion, cashAmount, udharSite, udharDueDate, staffUid, staffName, staffEmail, printed, skipCreditCheck, engineer } = input;
 
             const totalProfit = cart.reduce((sum, item) => sum + (item.profit || 0), 0);
             const saleData = {
@@ -424,6 +424,11 @@
                 cashAmount, udharAmount: udharPortion,
                 site: udharPortion > 0 ? (udharSite || '') : '',
                 dueDate: udharPortion > 0 ? (udharDueDate || null) : null,
+                // Engineer/Contractor referral info — used ONLY for the reward
+                // program (see the "engineers" collection below). Deliberately
+                // NOT read anywhere in generateReceiptHTML, so it never shows up
+                // on a printed/WhatsApp'd bill.
+                engineerName: (engineer && engineer.name) || '', engineerMobile: (engineer && engineer.mobile) || '',
                 voided: false,
                 returnedTotal: 0, returnedProfit: 0,
                 printed: !!printed,
@@ -463,6 +468,16 @@
                 customerDirRef = existingCust ? existingCust.ref : customersRef.doc();
             }
 
+            // Engineer/Contractor Reward Program tracking — a separate directory
+            // from customers, purely for tallying how much business each
+            // engineer/contractor has referred (never shown on the bill).
+            let engineerRef = null;
+            if (engineer && engineer.mobile && engineer.mobile.trim()) {
+                const engineersRef = db.collection('orgs').doc(orgId).collection('engineers');
+                const engSnap = await engineersRef.where('mobile', '==', engineer.mobile.trim()).limit(1).get();
+                engineerRef = engSnap.empty ? engineersRef.doc() : engSnap.docs[0].ref;
+            }
+
             const batch = db.batch();
             cart.forEach(item => {
                 const ref = db.collection('orgs').doc(orgId).collection('products').doc(item.id);
@@ -483,6 +498,16 @@
                 };
                 if (isNewCustomer) custData.firstPurchaseDate = new Date().toISOString();
                 batch.set(customerDirRef, custData, { merge: true });
+            }
+
+            if (engineerRef) {
+                batch.set(engineerRef, {
+                    name: (engineer.name || '').trim(), mobile: engineer.mobile.trim(),
+                    totalReferredAmount: FieldValue.increment(grandTotal),
+                    totalReferredBills: FieldValue.increment(1),
+                    lastActivityDate: new Date().toISOString(),
+                    createdAt: FieldValue.serverTimestamp()
+                }, { merge: true });
             }
 
             if (partyRef) {
@@ -553,18 +578,22 @@
             let digits = mobile.replace(/\D/g, '').replace(/^0+/, '');
             if (digits.length === 10) digits = '91' + digits;
             if (digits.length < 11) { alert('Mobile number sahi nahi lag raha (10 digit hona chahiye), check karke dobara try karo.'); return; }
-            // Using a fixed window NAME (instead of "_blank") means every send
-            // from this app re-uses the SAME browser tab instead of opening a
-            // new one each time. Note: this can only re-use a tab that THIS
-            // app itself opened earlier — a website is never allowed (browser
-            // security rule) to detect or re-use a WhatsApp Web/Desktop window
-            // that you opened separately yourself.
-            window.open(`https://wa.me/${digits}?text=${encodeURIComponent(message)}`, 'buildmart_whatsapp_tab');
+            // IMPORTANT: always open a fresh tab ("_blank"), not a reused named
+            // one. A reused tab keeps whatever text is still sitting unsent in
+            // WhatsApp Web's compose box, and WhatsApp APPENDS the new message
+            // text onto that instead of replacing it — that's exactly what was
+            // causing the message to show up doubled. A fresh tab always starts
+            // with an empty compose box, so this can't happen.
+            window.open(`https://wa.me/${digits}?text=${encodeURIComponent(message)}`, '_blank');
         }
 
         // Builds the bill message for WhatsApp — a full block in English FIRST,
         // then a full block in Marathi BELOW it (clearly separated), not mixed
         // word-by-word — easier for either the shop or the customer to read.
+        // Builds the bill message for WhatsApp — full English block FIRST, then
+        // full Marathi block BELOW it, clearly separated. Sent as ONE message
+        // (each block appears exactly once — the earlier "double" issue was
+        // caused by sendWhatsApp reusing a tab, not by this function).
         function buildBillMessage(sale, org) {
             const name = sale.customer.name || '';
             const paidAmt = sale.cashAmount != null ? sale.cashAmount : (sale.grandTotal - (sale.udharAmount || 0));
@@ -572,11 +601,11 @@
             const billNo = sale.id.toString().slice(-6);
             const dateStr = new Date(sale.date).toLocaleDateString();
 
-            const itemLinesEn = (sale.cart || []).map((it, idx) => `${idx + 1}. ${it.name} — ${it.qty} ${it.unit} = ₹${it.total.toFixed(2)}`).join('\n');
+            const itemLines = (sale.cart || []).map((it, idx) => `${idx + 1}. ${it.name} — ${it.qty} ${it.unit} = ₹${it.total.toFixed(2)}`).join('\n');
 
             let en = `🙏 Namaste ${name}!\n\n`;
             en += `*${org.name}* — your bill #${billNo}, ${dateStr}\n\n`;
-            en += `📦 Items:\n${itemLinesEn}\n\n`;
+            en += `📦 Items:\n${itemLines}\n\n`;
             en += `💰 Total: ₹${sale.grandTotal.toFixed(2)}\n`;
             if (paidAmt > 0) en += `✅ Paid: ₹${paidAmt.toFixed(2)}\n`;
             if (udharAmt > 0) en += `🔴 Udhar Due: ₹${udharAmt.toFixed(2)}${sale.dueDate ? ` (by ${new Date(sale.dueDate).toLocaleDateString()})` : ''}\n`;
@@ -584,7 +613,7 @@
 
             let mr = `🙏 नमस्कार ${name}!\n\n`;
             mr += `*${org.name}* — तुमचे बिल #${billNo}, ${dateStr}\n\n`;
-            mr += `📦 वस्तू:\n${itemLinesEn}\n\n`;
+            mr += `📦 वस्तू:\n${itemLines}\n\n`;
             mr += `💰 एकूण: ₹${sale.grandTotal.toFixed(2)}\n`;
             if (paidAmt > 0) mr += `✅ जमा: ₹${paidAmt.toFixed(2)}\n`;
             if (udharAmt > 0) mr += `🔴 उधार बाकी: ₹${udharAmt.toFixed(2)}${sale.dueDate ? ` (${new Date(sale.dueDate).toLocaleDateString()} पर्यंत)` : ''}\n`;
@@ -1906,6 +1935,8 @@
             const [udharDueDate, setUdharDueDate] = useState('');
             const [billDiscount, setBillDiscount] = useState(''); // extra flat ₹ discount on the whole bill
             const [customer, setCustomer] = useState({ name: '', mobile: '', gst: '', address: '' });
+            const [engineer, setEngineer] = useState({ name: '', mobile: '' }); // Reward Program — internal only, never printed on the bill
+            const [showEngineer, setShowEngineer] = useState(false);
             const [existingCustomerInfo, setExistingCustomerInfo] = useState(null); // { fromDirectory, party } — looked up when mobile is entered
             const [lookupBusy, setLookupBusy] = useState(false);
             const [saving, setSaving] = useState(false);
@@ -2186,12 +2217,13 @@
                         await db.collection('orgs').doc(orgId).collection('pendingApprovals').add({
                             cart, customer, billType, paymentMode, paymentMethod,
                             subtotal, gstAmount, billDiscountAmt, roundOff, grandTotal, udharPortion, cashAmount,
-                            udharSite, udharDueDate, discountPct: effectiveDiscountPct,
+                            udharSite, udharDueDate, engineer, discountPct: effectiveDiscountPct,
                             requestedByUid: firebaseUser.uid, requestedByName: userDoc.name, requestedByEmail: userDoc.email,
                             status: 'pending', createdAt: FieldValue.serverTimestamp()
                         });
                         alert(`Ye discount (${effectiveDiscountPct.toFixed(1)}%) admin ki approval-limit (${org.maxDiscountPct}%) se zyada hai. Bill admin ke paas approval ke liye bhej diya gaya hai — approve hote hi complete ho jayega.`);
                         setCart([]); setCustomer({ name: '', mobile: '', gst: '', address: '' }); setQuery(''); setExistingCustomerInfo(null);
+                        setEngineer({ name: '', mobile: '' }); setShowEngineer(false);
                         setPaymentMode('Cash'); setPaymentMethod('Cash'); setSplitCash(''); setUdharSite(''); setUdharDueDate(''); setBillDiscount('');
                         return;
                     }
@@ -2199,7 +2231,7 @@
                     const result = await finalizeSale(orgId, org, {
                         cart, customer, billType, paymentMode, paymentMethod,
                         subtotal, gstAmount, billDiscountAmt, roundOff, grandTotal, udharPortion, cashAmount,
-                        udharSite, udharDueDate,
+                        udharSite, udharDueDate, engineer,
                         staffUid: firebaseUser.uid, staffName: userDoc.name, staffEmail: userDoc.email,
                         printed: shouldPrint
                     });
@@ -2213,6 +2245,7 @@
 
                     setLastSale({ ...saleData, id: saleRef.id });
                     setCart([]); setCustomer({ name: '', mobile: '', gst: '', address: '' }); setQuery(''); setExistingCustomerInfo(null);
+                    setEngineer({ name: '', mobile: '' }); setShowEngineer(false);
                     setPaymentMode('Cash'); setPaymentMethod('Cash'); setSplitCash(''); setUdharSite(''); setUdharDueDate(''); setBillDiscount('');
                 } catch (e) {
                     alert('Error: ' + e.message);
@@ -2324,6 +2357,17 @@
                             </div>
                             <input className="border p-1 rounded w-full text-sm" placeholder="Address (optional)" value={customer.address} onChange={e => setCustomer({ ...customer, address: e.target.value })} />
                             {lookupBusy && <p className="text-xs text-gray-400">Customer check ho raha hai...</p>}
+
+                            <button type="button" onClick={() => setShowEngineer(!showEngineer)} className="text-xs text-purple-600 font-bold underline">
+                                {showEngineer ? 'Engineer/Contractor Hide Karo' : '🎁 + Engineer/Contractor Add Karo (Reward Program)'}
+                            </button>
+                            {showEngineer && (
+                                <div className="bg-purple-50 border border-purple-200 rounded p-2 space-y-1">
+                                    <p className="text-xs text-purple-700 font-bold">Ye customer kis Engineer/Contractor ki wajah se aaya? (Bill pe print NAHI hoga)</p>
+                                    <input className="border p-1 rounded w-full text-sm" placeholder="Engineer/Contractor ka Naam" value={engineer.name} onChange={e => setEngineer({ ...engineer, name: e.target.value })} />
+                                    <input className="border p-1 rounded w-full text-sm" placeholder="Unka Mobile Number" value={engineer.mobile} onChange={e => setEngineer({ ...engineer, mobile: e.target.value })} />
+                                </div>
+                            )}
                             {existingCustomerInfo && (
                                 <div className="bg-blue-50 border border-blue-200 rounded p-2 text-xs">
                                     <p className="font-bold text-blue-700">👤 Pehchana hua customer{existingCustomerInfo.directory ? ` — ${existingCustomerInfo.directory.totalPurchases || 0} baar pehle khareeda` : ''}</p>
@@ -3465,6 +3509,9 @@
             const logoFileRef = useRef();
             const [branches, setBranches] = useState(org.branches || []);
             const [newBranchName, setNewBranchName] = useState('');
+            const [rewardTiers, setRewardTiers] = useState(org.rewardTiers || []);
+            const [newTierAmount, setNewTierAmount] = useState('');
+            const [newTierReward, setNewTierReward] = useState('');
 
             useEffect(() => {
                 if (!showActivityLog) return;
@@ -3485,6 +3532,20 @@
                 const updated = branches.filter(b => b.id !== id);
                 setBranches(updated);
                 await db.collection('orgs').doc(orgId).update({ branches: updated });
+            };
+
+            const addTier = async () => {
+                if (!newTierAmount || !newTierReward.trim()) return;
+                const updated = [...rewardTiers, { id: 't' + Date.now(), amount: Number(newTierAmount), reward: newTierReward.trim() }]
+                    .sort((a, b) => a.amount - b.amount);
+                setRewardTiers(updated);
+                await db.collection('orgs').doc(orgId).update({ rewardTiers: updated });
+                setNewTierAmount(''); setNewTierReward('');
+            };
+            const removeTier = async (id) => {
+                const updated = rewardTiers.filter(t => t.id !== id);
+                setRewardTiers(updated);
+                await db.collection('orgs').doc(orgId).update({ rewardTiers: updated });
             };
 
             const save = async (e) => {
@@ -3680,6 +3741,28 @@
                     </div>
 
                     <div className="bg-white p-6 rounded shadow max-w-xl mb-6">
+                        <h3 className="font-bold mb-1">🎁 Engineer/Contractor Reward Tiers</h3>
+                        <p className="text-xs text-gray-500 mb-3">
+                            Jab kisi engineer/contractor ke through customers ka total purchase kisi tier ko cross kare, wo reward ke liye eligible ho jayega — POS mein customer ke saath "Engineer/Contractor" naam-mobile add karna hoga.
+                        </p>
+                        <div className="flex gap-2 mb-3">
+                            <input type="number" className="border p-2 rounded w-32" placeholder="Amount ₹" value={newTierAmount} onChange={e => setNewTierAmount(e.target.value)} />
+                            <input className="border p-2 rounded flex-1" placeholder="Reward (jaise: ₹1000 cash, Gift Voucher)" value={newTierReward} onChange={e => setNewTierReward(e.target.value)} />
+                            <button onClick={addTier} className="bg-slate-700 text-white px-4 py-2 rounded font-bold">+ Add</button>
+                        </div>
+                        {rewardTiers.length > 0 ? (
+                            <div className="space-y-1">
+                                {rewardTiers.map(t => (
+                                    <div key={t.id} className="flex justify-between items-center bg-gray-50 p-2 rounded text-sm">
+                                        <span><strong>₹{t.amount.toLocaleString()}</strong> purchase par → {t.reward}</span>
+                                        <button onClick={() => removeTier(t.id)} className="text-red-500 text-xs">Remove</button>
+                                    </div>
+                                ))}
+                            </div>
+                        ) : <p className="text-xs text-gray-400">Koi tier set nahi hai.</p>}
+                    </div>
+
+                    <div className="bg-white p-6 rounded shadow max-w-xl mb-6">
                         <h3 className="font-bold mb-2">Staff Activity Log</h3>
                         <p className="text-sm text-gray-500 mb-3">Kis staff ne kab kya kiya (bill void, product delete, permission change, etc.) — audit ke liye.</p>
                         <button onClick={() => setShowActivityLog(!showActivityLog)} className="bg-slate-700 text-white px-4 py-2 rounded font-bold mb-3">
@@ -3721,7 +3804,9 @@
         // 11. KHATA BOOK — Udhar diya (customers) / Udhar liya (suppliers)
         // ============================================================
         const KhataBook = ({ orgId, org, userDoc, firebaseUser, products, sales, lang, isAdmin }) => {
-            const [tab, setTab] = useState('customer'); // customer | supplier | directory
+            const [tab, setTab] = useState('customer'); // customer | supplier | directory | engineers
+            const [engineersList, setEngineersList] = useState([]);
+            const [openEngineer, setOpenEngineer] = useState(null);
             const [parties, setParties] = useState([]);
             const [search, setSearch] = useState('');
             const [openParty, setOpenParty] = useState(null); // party being viewed/paid
@@ -3753,6 +3838,12 @@
                 if (tab === 'directory') {
                     const unsub = db.collection('orgs').doc(orgId).collection('customers').onSnapshot(snap => {
                         setCustomersList(snap.docs.map(d => ({ id: d.id, ...d.data() })));
+                    });
+                    return unsub;
+                }
+                if (tab === 'engineers') {
+                    const unsub = db.collection('orgs').doc(orgId).collection('engineers').onSnapshot(snap => {
+                        setEngineersList(snap.docs.map(d => ({ id: d.id, ...d.data() })));
                     });
                     return unsub;
                 }
@@ -3967,9 +4058,12 @@
                         <button onClick={() => { setTab('directory'); setOpenParty(null); }} className={`px-4 py-2 rounded font-bold ${tab === 'directory' ? 'bg-slate-800 text-white' : 'bg-white border'}`}>
                             📇 Sabhi Customers (Directory)
                         </button>
+                        <button onClick={() => { setTab('engineers'); setOpenParty(null); }} className={`px-4 py-2 rounded font-bold ${tab === 'engineers' ? 'bg-slate-800 text-white' : 'bg-white border'}`}>
+                            🎁 Engineer/Contractor Rewards
+                        </button>
                     </div>
 
-                    {tab !== 'directory' && (<>
+                    {tab !== 'directory' && tab !== 'engineers' && (<>
                     <div className={`mb-4 p-4 rounded shadow text-white ${tab === 'customer' ? 'bg-green-600' : 'bg-red-600'}`}>
                         <p className="text-sm opacity-90">{tab === 'customer' ? t(lang, 'khata_toReceive') : t(lang, 'khata_toPay')}</p>
                         <h3 className="text-2xl font-bold">₹{totalOutstanding.toLocaleString()}</h3>
@@ -4180,6 +4274,61 @@
                             )}
                         </div>
                     )}
+
+                    {tab === 'engineers' && (() => {
+                        const tiers = (org.rewardTiers || []).slice().sort((a, b) => a.amount - b.amount);
+                        const getTierInfo = (amount) => {
+                            const reached = tiers.filter(t => amount >= t.amount);
+                            const current = reached.length ? reached[reached.length - 1] : null;
+                            const next = tiers.find(t => amount < t.amount);
+                            return { current, next };
+                        };
+                        return (
+                            <div>
+                                <div className="mb-4 p-4 rounded shadow bg-purple-600 text-white">
+                                    <p className="text-sm opacity-90">Total Engineers/Contractors</p>
+                                    <h3 className="text-2xl font-bold">{engineersList.length}</h3>
+                                    <p className="text-xs opacity-75 mt-1">Ye log jinke through customers refer huye — POS mein "Engineer/Contractor Add Karo" se link hota hai.</p>
+                                </div>
+                                {tiers.length === 0 && (
+                                    <p className="text-sm text-orange-600 bg-orange-50 border border-orange-200 rounded p-2 mb-4">Abhi koi Reward Tier set nahi hai — Settings mein "🎁 Engineer/Contractor Reward Tiers" se set karo.</p>
+                                )}
+                                <div className="bg-white rounded shadow overflow-hidden">
+                                    <table className="w-full text-sm">
+                                        <thead className="bg-gray-100 border-b text-left">
+                                            <tr><th className="p-3">Naam</th><th className="p-3">Mobile</th><th className="p-3">Bills</th><th className="p-3 text-right">Total Referred</th><th className="p-3">Current Reward</th><th className="p-3">Action</th></tr>
+                                        </thead>
+                                        <tbody>
+                                            {engineersList.sort((a, b) => (b.totalReferredAmount || 0) - (a.totalReferredAmount || 0)).map(e => {
+                                                const { current, next } = getTierInfo(e.totalReferredAmount || 0);
+                                                return (
+                                                    <tr key={e.id} className="border-b hover:bg-gray-50">
+                                                        <td className="p-3 font-bold">{e.name || '—'}</td>
+                                                        <td className="p-3">{e.mobile}</td>
+                                                        <td className="p-3">{e.totalReferredBills || 0}</td>
+                                                        <td className="p-3 text-right font-bold">₹{(e.totalReferredAmount || 0).toLocaleString()}</td>
+                                                        <td className="p-3">
+                                                            {current ? <span className="text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded font-bold">✓ {current.reward}</span> : <span className="text-xs text-gray-400">Koi tier nahi</span>}
+                                                            {next && <div className="text-xs text-gray-400 mt-1">Agla: ₹{next.amount.toLocaleString()} par {next.reward}</div>}
+                                                        </td>
+                                                        <td className="p-3">
+                                                            {e.mobile && (
+                                                                <button onClick={() => {
+                                                                    const msg = `Namaste ${e.name || ''}! 🙏\n${org.name} ki taraf se update:\n\nAapke through total business: ₹${(e.totalReferredAmount || 0).toLocaleString()}\n${current ? `🎁 Aap eligible hain: ${current.reward}` : ''}${next ? `\n📈 Agla reward: ₹${next.amount.toLocaleString()} par ${next.reward} (abhi ₹${(next.amount - (e.totalReferredAmount || 0)).toLocaleString()} aur chahiye)` : ''}\n\nDhanyawad saath dene ke liye! 🙏`;
+                                                                    sendWhatsApp(e.mobile, msg);
+                                                                }} className="text-green-600 text-xs border px-2 py-1 rounded font-bold">📱 Update Bhejo</button>
+                                                            )}
+                                                        </td>
+                                                    </tr>
+                                                );
+                                            })}
+                                        </tbody>
+                                    </table>
+                                    {engineersList.length === 0 && <div className="p-4 text-center text-gray-500">Abhi tak koi engineer/contractor link nahi hua.</div>}
+                                </div>
+                            </div>
+                        );
+                    })()}
 
                     {showAddCustomer && (
                         <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
@@ -4511,7 +4660,7 @@
                     const result = await finalizeSale(orgId, org, {
                         cart: p.cart, customer: p.customer, billType: p.billType, paymentMode: p.paymentMode, paymentMethod: p.paymentMethod,
                         subtotal: p.subtotal, gstAmount: p.gstAmount, billDiscountAmt: p.billDiscountAmt, roundOff: p.roundOff, grandTotal: p.grandTotal,
-                        udharPortion: p.udharPortion, cashAmount: p.cashAmount, udharSite: p.udharSite, udharDueDate: p.udharDueDate,
+                        udharPortion: p.udharPortion, cashAmount: p.cashAmount, udharSite: p.udharSite, udharDueDate: p.udharDueDate, engineer: p.engineer,
                         staffUid: p.requestedByUid, staffName: p.requestedByName, staffEmail: p.requestedByEmail,
                         printed: false, skipCreditCheck: true
                     });
