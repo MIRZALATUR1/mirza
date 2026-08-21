@@ -2632,16 +2632,18 @@
             const [exchangeCart, setExchangeCart] = useState([]);
             const [exchangeQuery, setExchangeQuery] = useState('');
             const [busy, setBusy] = useState(false);
+            const [showVoided, setShowVoided] = useState(false);
             const isAdmin = userDoc.role === 'owner' || userDoc.role === 'admin';
 
             const filteredSales = sales.filter(s => {
                 const sDate = (s.date || '').split('T')[0];
                 const dateMatch = (!filter.from || sDate >= filter.from) && (!filter.to || sDate <= filter.to);
                 const userMatch = isAdmin ? true : s.staffUid === userDoc.uid;
+                const voidMatch = showVoided ? true : !s.voided;
                 const term = searchTerm.toLowerCase();
                 const searchMatch = !term || (s.customer.name || '').toLowerCase().includes(term) || s.id.toString().includes(searchTerm)
                     || (s.cart || []).some(item => item.name.toLowerCase().includes(term));
-                return dateMatch && userMatch && searchMatch;
+                return dateMatch && userMatch && voidMatch && searchMatch;
             }).slice().reverse();
 
             const reprintSale = (s) => {
@@ -2799,6 +2801,27 @@
                 }
             };
 
+            // Permanently erases a VOIDED bill from Firestore — admin only. Use
+            // with care: once deleted, there's no audit trail left showing this
+            // bill ever existed (unlike Void, which keeps the record but marks
+            // it cancelled). Only usable on bills that are already voided, so a
+            // live/active bill can never be skipped straight to permanent deletion.
+            const permanentlyDeleteSale = async (sale) => {
+                const sure = confirm(`⚠ "Bill #${sale.id.toString().slice(-6)}" ko HAMESHA KE LIYE delete karna hai?\n\nYe VOID se alag hai — is bill ka koi record kahin nahi bachega, audit log me bhi nahi. Ye wapas nahi ho sakta.\n\nPakka?`);
+                if (!sure) return;
+                const typed = prompt('Confirm karne ke liye "DELETE" type karo:');
+                if (typed !== 'DELETE') { alert('Cancel ho gaya — "DELETE" match nahi hua.'); return; }
+                setBusy(true);
+                try {
+                    await db.collection('orgs').doc(orgId).collection('sales').doc(sale.id).delete();
+                    logActivity(orgId, userDoc, 'Bill Permanently Deleted', `Bill #${sale.id.toString().slice(-6)} — ₹${sale.grandTotal}`);
+                } catch (e) {
+                    alert('Error: ' + e.message);
+                } finally {
+                    setBusy(false);
+                }
+            };
+
             const openReturn = (sale) => {
                 setReturnSale(sale);
                 setReturnQtys({});
@@ -2923,6 +2946,10 @@
                         <button onClick={downloadExcel} className="bg-green-600 text-white p-2 rounded font-bold">Export Excel</button>
                         <button onClick={downloadPDF} className="bg-red-600 text-white p-2 rounded font-bold">Download PDF</button>
                         <button onClick={downloadGSTR} className="bg-purple-600 text-white p-2 rounded font-bold">GSTR Export</button>
+                        <label className="flex items-center gap-1 text-sm cursor-pointer">
+                            <input type="checkbox" checked={showVoided} onChange={e => setShowVoided(e.target.checked)} />
+                            Voided bhi dikhao
+                        </label>
                     </div>
 
                     {isAdmin && staffSummary.length > 0 && (
@@ -2980,6 +3007,9 @@
                                                     <button disabled={busy} onClick={() => openReturn(s)} className="text-blue-600 text-xs border px-2 py-1 rounded mr-1">Return</button>
                                                     <button disabled={busy} onClick={() => voidSale(s)} className="text-red-600 text-xs border px-2 py-1 rounded">Void</button>
                                                 </>
+                                            )}
+                                            {isAdmin && s.voided && (
+                                                <button disabled={busy} onClick={() => permanentlyDeleteSale(s)} className="text-red-800 bg-red-50 text-xs border border-red-300 px-2 py-1 rounded" title="Hamesha ke liye delete — wapas nahi hoga">🗑 Permanently Delete</button>
                                             )}
                                         </td>
                                     </tr>
